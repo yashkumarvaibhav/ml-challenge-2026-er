@@ -6,6 +6,9 @@ come from the world's S1 population (recomputed per ghost world).
 """
 import math
 import multiprocessing as mp
+import os
+import shutil
+import uuid
 
 import numpy as np
 import polars as pl
@@ -81,7 +84,9 @@ def _pair_feats(r1, r2, blk, ctx, nidf, aidf, ndef, adef):
     ]
     a1, a2 = r1["a_tok"], r2["a_tok"]
     if r2["a_null"] or not a2:
-        f += [1.0] + [np.nan] * 22
+        nan = np.nan
+        f += [1.0, nan, nan, nan, nan, nan, nan, nan, nan, nan, nan, nan, nan, nan, nan,
+              len(set(r1["a_nums"])), 0, nan, nan, len(a1), 0, r1["a_ncomma"], 0, nan]
     else:
         s1a, s2a = " ".join(a1), " ".join(a2)
         aw1 = {t for t in a1 if not t.isdigit()}
@@ -109,40 +114,62 @@ def _pair_feats(r1, r2, blk, ctx, nidf, aidf, ndef, adef):
     return f
 
 
-def _work(bounds):
-    lo, hi = bounds
-    P = _G["pairs"]
-    R1, R2 = _G["r1"], _G["r2"]
-    out = np.empty((hi - lo, len(FEATURES)), np.float32)
-    for i in range(lo, hi):
-        j1, j2 = P["i1"][i], P["i2"][i]
-        r1 = {k: R1[k][j1] for k in R1}
-        r2 = {k: R2[k][j2] for k in R2}
-        cty = r1["country"]
-        blk = [P[k][i] for k in ("s_a", "s_b", "s_c", "r_a", "r_b", "r_c", "r_e", "in_d", "prio")]
-        ctx = [P[k][i] for k in ("amb_s1_core", "amb_pool_core", "c_n_cand", "c_sc_rel", "c_sc_rank")]
-        nidf, aidf = _G["nidf"][cty], _G["aidf"][cty]
-        out[i - lo] = _pair_feats(r1, r2, blk, ctx, nidf, aidf, _G["ndef"][cty], _G["adef"][cty])
-    return lo, out
+REC_COLS = ["country", "n_tok", "a_tok", "a_comp", "a_nums", "n_native", "n_native_mapped_frac", "n_allcaps",
+            "n_accent", "n_domain", "n_dba", "a_null", "a_ncomma"]
+BLK_COLS = ["s_a", "s_b", "s_c", "r_a", "r_b", "r_c", "r_e", "in_d", "prio"]
+CTX_COLS = ["amb_s1_core", "amb_pool_core", "c_n_cand", "c_sc_rel", "c_sc_rank"]
+
+
+def _work(job):
+    """job = (offset, path to a chunk parquet in /dev/shm). Spawned workers read and
+    convert their own chunk, so the parent does no per-value Python conversion and
+    no large object is shared through fork (bounded memory, no polars-after-fork)."""
+    off, path = job
+    P = pl.read_parquet(path).to_dict(as_series=False)
+    os.remove(path)
+    n = len(P["s_a"])
+    out = np.empty((n, len(FEATURES)), np.float32)
+    for i in range(n):
+        r1 = {k: P["1_" + k][i] for k in REC_COLS}
+        r2 = {k: P["2_" + k][i] for k in REC_COLS}
+        r2["is_s3"] = P["is_s3"][i]
+        nidf = dict(zip(r1["n_tok"], P["1_n_idf"][i]))
+        nidf.update(zip(r2["n_tok"], P["2_n_idf"][i]))
+        aidf = dict(zip(r1["a_tok"], P["1_a_idf"][i]))
+        aidf.update(zip(r2["a_tok"], P["2_a_idf"][i]))
+        blk = [P[k][i] for k in BLK_COLS]
+        ctx = [P[k][i] for k in CTX_COLS]
+        out[i] = _pair_feats(r1, r2, blk, ctx, nidf, aidf, 0.0, 0.0)
+    return off, out
 
 
 def _idf_tables(pool: pl.DataFrame):
-    nidf, aidf, ndef, adef = {}, {}, {}, {}
-    for (cty,), g in pool.group_by("country"):
-        N = g.height
-        nd = g.select(pl.col("n_tok").list.unique()).explode("n_tok").group_by("n_tok").len()
-        ad = g.select(pl.col("a_tok").list.unique()).explode("a_tok").group_by("a_tok").len()
-        nidf[cty] = {t: math.log(N / c) for t, c in nd.iter_rows() if t is not None}
-        aidf[cty] = {t: math.log(N / c) for t, c in ad.iter_rows() if t is not None}
-        ndef[cty] = adef[cty] = math.log(N)  # unseen token = rarest
-    return nidf, aidf, ndef, adef
+    """Per-country (tok, idf) tables from the pool (label-free); unseen token = log(N)."""
+    N = pool.group_by("country").len().rename({"len": "N"})
+    out = {}
+    for col in ("n_tok", "a_tok"):
+        t = (pool.select("country", pl.col(col).list.unique().alias("tok")).explode("tok").drop_nulls()
+             .group_by("country", "tok").len().join(N, on="country")
+             .with_columns((pl.col("N") / pl.col("len")).log().cast(pl.Float32).alias("idf")).select("country", "tok", "idf"))
+        out[col] = t
+    return out, N.with_columns(pl.col("N").log().cast(pl.Float32).alias("unseen")).select("country", "unseen")
+
+
+def _with_idf(df: pl.DataFrame, col: str, table: pl.DataFrame, unseen: pl.DataFrame, out: str) -> pl.DataFrame:
+    """Adds `out`: list of idf values aligned with list column `col` (zip-safe)."""
+    e = (df.select("entity_id", "country", col).explode(col).with_row_index("_o")
+         .join(table, left_on=["country", col], right_on=["country", "tok"], how="left")
+         .join(unseen, on="country", how="left")
+         .with_columns(pl.col("idf").fill_null(pl.col("unseen")))
+         .sort("_o").group_by("entity_id", maintain_order=True).agg(pl.col("idf").alias(out)))
+    return df.join(e, on="entity_id", how="left")
 
 
 def build(split: str, cand: pl.DataFrame, world_ids: pl.DataFrame, name: str) -> pl.DataFrame:
     """Returns cand (s1, m, ...) with FEATURES columns appended."""
     s1 = pl.read_parquet(C.CACHE / "norm_final" / f"{split}_s1.parquet", columns=NORM_COLS)
     pool = pl.concat([pl.read_parquet(C.CACHE / "norm_final" / f"{split}_s{s}.parquet", columns=NORM_COLS) for s in (2, 3)])
-    nidf, aidf, ndef, adef = _idf_tables(pool)
+    idf_tabs, unseen = _idf_tables(pool)
 
     # name ambiguity: how many world S1s / pool records share the sorted-token name key
     key = pl.col("n_tok").list.sort().list.join(" ")
@@ -150,38 +177,48 @@ def build(split: str, cand: pl.DataFrame, world_ids: pl.DataFrame, name: str) ->
     s1k = world.select("country", key.alias("k")).group_by("country", "k").len().rename({"len": "amb_s1_core"})
     pk = pool.select("country", key.alias("k")).group_by("country", "k").len().rename({"len": "amb_pool_core"})
 
-    q = s1.join(cand.select(pl.col("s1").alias("entity_id")).unique(), on="entity_id").with_row_index("i1")
-    ms = pool.join(cand.select(pl.col("m").alias("entity_id")).unique(), on="entity_id").with_row_index("i2")
-    q = q.with_columns(key.alias("k")).join(s1k, on=["country", "k"], how="left")
-    ms = ms.with_columns(key.alias("k")).join(pk, on=["country", "k"], how="left")
-
-    c = (cand.join(q.select(pl.col("entity_id").alias("s1"), "i1", "amb_s1_core"), on="s1")
-         .join(ms.select(pl.col("entity_id").alias("m"), "i2", "amb_pool_core"), on="m"))
-    c = c.with_columns(
+    c = cand.with_columns(
         pl.len().over("s1").alias("c_n_cand"),
         (pl.col("s_c").fill_null(0) / pl.col("s_c").fill_null(0).max().over("s1").clip(lower_bound=1e-6)).alias("c_sc_rel"),
         pl.col("s_c").fill_null(0).rank("ordinal", descending=True).over("s1").alias("c_sc_rank"),
         pl.col("in_d").cast(pl.Float32),
     )
-    num = ["s_a", "s_b", "s_c", "r_a", "r_b", "r_c", "r_e", "in_d", "prio", "amb_s1_core", "amb_pool_core",
-           "c_n_cand", "c_sc_rel", "c_sc_rank"]
-    _G["pairs"] = {"i1": c["i1"].to_numpy(), "i2": c["i2"].to_numpy(),
-                   **{k: c[k].cast(pl.Float32).fill_null(np.nan).to_numpy() for k in num}}
-    rec_cols = ["country", "n_tok", "a_tok", "a_comp", "a_nums", "n_native", "n_native_mapped_frac", "n_allcaps",
-                "n_accent", "n_domain", "n_dba", "a_null", "a_ncomma"]
-    _G["r1"] = {k: q[k].to_list() for k in rec_cols}
-    ms = ms.with_columns(pl.col("entity_id").str.starts_with("S3-").alias("is_s3"))
-    _G["r2"] = {k: ms[k].to_list() for k in rec_cols + ["is_s3"]}
-    _G.update(nidf=nidf, aidf=aidf, ndef=ndef, adef=adef)
+    q = s1.join(c.select(pl.col("s1").alias("entity_id")).unique(), on="entity_id").with_columns(key.alias("k")) \
+        .join(s1k, on=["country", "k"], how="left").drop("k")
+    ms = pool.join(c.select(pl.col("m").alias("entity_id")).unique(), on="entity_id").with_columns(key.alias("k")) \
+        .join(pk, on=["country", "k"], how="left").drop("k") \
+        .with_columns(pl.col("entity_id").str.starts_with("S3-").alias("is_s3"))
+    for col, out in (("n_tok", "n_idf"), ("a_tok", "a_idf")):
+        q = _with_idf(q, col, idf_tabs[col], unseen, out)
+        ms = _with_idf(ms, col, idf_tabs[col], unseen, out)
+    cols = REC_COLS + ["n_idf", "a_idf"]
+    rec1 = q.select(pl.col("entity_id").alias("s1"), "amb_s1_core", *[pl.col(k).alias("1_" + k) for k in cols])
+    rec2 = ms.select(pl.col("entity_id").alias("m"), "amb_pool_core", "is_s3", *[pl.col(k).alias("2_" + k) for k in cols])
+    num = BLK_COLS + CTX_COLS
 
     n = c.height
-    bounds = [(i, min(n, i + 20_000)) for i in range(0, n, 20_000)]
     X = np.empty((n, len(FEATURES)), np.float32)
     prog = Progress(name, n, unit="pairs")
-    with mp.get_context("fork").Pool(C.N_PROCS) as pool_:
-        for lo, out in pool_.imap_unordered(_work, bounds, chunksize=1):
-            X[lo:lo + len(out)] = out
-            prog.update(len(out))
+    BATCH, CHUNK = 1_000_000, 10_000
+    tmp = f"/dev/shm/ber_feat_{uuid.uuid4().hex[:8]}"
+    os.makedirs(tmp)
+    try:
+        with mp.get_context("spawn").Pool(C.N_PROCS) as pool_:
+            pending = []
+            for b0 in range(0, n, BATCH):
+                b = c.slice(b0, BATCH).join(rec1, on="s1", how="left", maintain_order="left") \
+                    .join(rec2, on="m", how="left", maintain_order="left") \
+                    .with_columns([pl.col(k).cast(pl.Float32).fill_null(np.nan) for k in num]).drop("s1", "m")
+                for i in range(0, b.height, CHUNK):
+                    path = f"{tmp}/{b0 + i}.parquet"
+                    b.slice(i, CHUNK).write_parquet(path, compression="uncompressed")
+                    pending.append(pool_.apply_async(_work, ((b0 + i, path),)))
+                # collect finished work while the next batch is prepared (bounded backlog)
+                while len(pending) > 4 * C.N_PROCS or (b0 + BATCH >= n and pending):
+                    off, out = pending.pop(0).get()
+                    X[off:off + len(out)] = out
+                    prog.update(len(out))
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
     prog.done()
-    _G.clear()
     return c.select("s1", "m").with_columns(pl.from_numpy(X, schema=FEATURES))

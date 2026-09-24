@@ -92,14 +92,14 @@ def _fwd_chunk(bounds):
     for ch, S, k in (("a", sn, KA), ("b", sa, KB), ("c", sc, KC)):
         r, c, v, rk = _topk_rows(S, k)
         out.append((ch, r + lo, c, v, rk))
-    return out
+    return hi - lo, out
 
 
 def _rev_chunk(bounds):
     lo, hi = bounds
     S = (_G["RQ"][lo:hi] @ _G["S1T"]).tocsr()
     r, c, v, rk = _topk_rows(S, KE)
-    return r + lo, c, v, rk
+    return hi - lo, (r + lo, c, v, rk)
 
 
 def _run_pool(fn, n, chunk, name):
@@ -107,9 +107,9 @@ def _run_pool(fn, n, chunk, name):
     prog = Progress(name, n, unit="rows")
     res = []
     with mp.get_context("fork").Pool(C.N_PROCS) as pool:
-        for out, (lo, hi) in zip(pool.imap(fn, bounds, chunksize=1), bounds):
-            res.append(out)
-            prog.update(hi - lo)
+        for n_rows, out in pool.imap_unordered(fn, bounds, chunksize=1):
+            res.append(out)  # order does not matter: rows carry absolute indices
+            prog.update(n_rows)
     prog.done()
     return res
 
@@ -117,9 +117,11 @@ def _run_pool(fn, n, chunk, name):
 def block_country(s1q: pl.DataFrame, s1_world: pl.DataFrame, pool: pl.DataFrame, cty: str) -> pl.DataFrame:
     """Candidates for queries s1q (subset of s1_world) against pool, one country."""
     t0 = time.time()
-    pool = pool.with_row_index("row")
-    world = s1_world.with_row_index("row")
-    q = s1q.join(world.select("entity_id", pl.col("row").alias("wrow")), on="entity_id").with_row_index("row")
+    I64 = pl.Int64
+    pool = pool.with_row_index("row").with_columns(pl.col("row").cast(I64))
+    world = s1_world.with_row_index("row").with_columns(pl.col("row").cast(I64))
+    q = (s1q.join(world.select("entity_id", pl.col("row").alias("wrow")), on="entity_id")
+         .with_row_index("row").with_columns(pl.col("row").cast(I64)))
 
     pt = record_tokens(pool)
     df = pt.group_by("tok").agg(pl.len().alias("df"), pl.col("kind").first())
@@ -146,14 +148,14 @@ def block_country(s1q: pl.DataFrame, s1_world: pl.DataFrame, pool: pl.DataFrame,
     fwd = []
     for chunk in parts:
         for ch, r, c, v, rk in chunk:
-            fwd.append(pl.DataFrame({"qrow": r, "prow": c, f"s_{ch}": v, f"r_{ch}": rk}))
+            fwd.append(pl.DataFrame({"qrow": r.astype(np.int64), "prow": c.astype(np.int64), f"s_{ch}": v, f"r_{ch}": rk}))
     by_ch = {}
     for f in fwd:
         ch = [c for c in f.columns if c.startswith("r_")][0][2:]
         by_ch.setdefault(ch, []).append(f)
     cand = None
     for ch in ("a", "b", "c"):
-        f = pl.concat(by_ch[ch]) if ch in by_ch else pl.DataFrame(schema={"qrow": pl.Int32, "prow": pl.Int32})
+        f = pl.concat(by_ch[ch]) if ch in by_ch else pl.DataFrame(schema={"qrow": pl.Int64, "prow": pl.Int64})
         cand = f if cand is None else cand.join(f, on=["qrow", "prow"], how="full", coalesce=True)
     for k in ("PNT", "PAT", "QN", "QA"):
         _G.pop(k, None)
@@ -162,7 +164,7 @@ def block_country(s1q: pl.DataFrame, s1_world: pl.DataFrame, pool: pl.DataFrame,
     _G["RQ"] = _csr(pt, pool.height, V, idf[pt["tid"].to_numpy()])
     _G["S1T"] = _csr(wt, world.height, V).T.tocsr()
     rparts = _run_pool(_rev_chunk, pool.height, 5000, f"block {cty} reverse")
-    rev = pl.concat([pl.DataFrame({"prow": r, "wrow": c, "r_e": rk}) for r, c, v, rk in rparts])
+    rev = pl.concat([pl.DataFrame({"prow": r.astype(np.int64), "wrow": c.astype(np.int64), "r_e": rk}) for r, c, v, rk in rparts])
     rev = rev.join(q.select(pl.col("row").alias("qrow"), "wrow"), on="wrow").drop("wrow")
     for k in ("RQ", "S1T"):
         _G.pop(k, None)

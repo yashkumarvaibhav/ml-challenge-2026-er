@@ -35,8 +35,8 @@ def _init(maps: dict, seg_counts: dict):
     _G["seg"] = {c: Segmenter(cnt) for c, cnt in (seg_counts or {}).items()}
 
 
-def _work(chunk):
-    names, addrs, countries = chunk
+def _work(job):
+    idx, (names, addrs, countries) = job
     out = {k: [] for k in COLS}
     for n, a, c in zip(names, addrs, countries):
         r = norm_name(n, _G["native"], _G["seg"].get(c))
@@ -46,7 +46,7 @@ def _work(chunk):
         r.update(norm_addr(a, _G["comp"].get(c), _G["tok"].get(c)))
         for k in COLS:
             out[k].append(SEP.join(r[k]) if k in LIST_COLS else r[k])
-    return out
+    return idx, out
 
 
 def normalize_df(df: pl.DataFrame, maps: dict = None, seg_counts: dict = None, chunk: int = 20_000,
@@ -56,10 +56,10 @@ def normalize_df(df: pl.DataFrame, maps: dict = None, seg_counts: dict = None, c
     ctys = df["country"].to_list()
     chunks = [(names[i:i + chunk], addrs[i:i + chunk], ctys[i:i + chunk]) for i in range(0, len(names), chunk)]
     prog = Progress(name, total=len(names), unit="records")
-    parts = []
+    parts = [None] * len(chunks)
     with mp.get_context("fork").Pool(C.N_PROCS, initializer=_init, initargs=(maps, seg_counts)) as pool:
-        for part in pool.imap(_work, chunks, chunksize=1):  # ordered
-            parts.append(part)
+        for idx, part in pool.imap_unordered(_work, enumerate(chunks), chunksize=1):
+            parts[idx] = part  # re-ordered by chunk index
             prog.update(len(part["n_tok"]))
     prog.done()
     cols = {k: [v for p in parts for v in p[k]] for k in COLS}
