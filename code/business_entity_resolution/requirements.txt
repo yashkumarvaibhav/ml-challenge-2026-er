@@ -1,0 +1,10 @@
+# Python 3.10.12. Pinned from the environment used to produce the submissions.
+polars==1.44.2
+pyarrow==20.0.0
+numpy==1.26.4
+pandas==2.0.3
+scipy==1.12.0
+scikit-learn==1.4.2
+rapidfuzz==3.14.5
+Unidecode==1.4.0
+lightgbm==4.7.0
