@@ -5,6 +5,7 @@ Training rows: candidates of training-portion S1s (world20). Early stopping uses
 holdout half A and reported on half B, and vice versa (V6).
 """
 import json
+import os
 
 import lightgbm as lgb
 import numpy as np
@@ -17,7 +18,12 @@ from .progress import step
 
 PARAMS = dict(objective="binary", learning_rate=0.05, num_leaves=127, min_data_in_leaf=200,
               feature_fraction=0.8, bagging_fraction=0.8, bagging_freq=1, lambda_l2=1.0,
-              num_threads=C.N_PROCS, verbose=-1, seed=C.SEED)
+              num_threads=int(os.environ.get("BER_LGB_THREADS", C.N_PROCS)), verbose=-1, seed=C.SEED)
+
+
+# Decision grids (b5_retune_wide.json: the first grid topped out at t_any = 0.5).
+GRID_ANY = [0.1, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9]
+GRID_ADD = [0.5, 0.6, 0.65, 0.7, 0.75, 0.8, 0.85, 0.9]
 
 
 def label(feats: pl.DataFrame, truth: pl.DataFrame) -> pl.DataFrame:
@@ -57,8 +63,10 @@ def decide(scored: pl.DataFrame, t_any: float, t_add: float, resolve: bool = Fal
     resolve: each m is kept only for its highest-p S1 among the scored rows (ordering B:
              threshold first, then resolve conflicts).
     """
-    d = scored.with_columns(pl.col("p").rank("ordinal", descending=True).over("s1").alias("rk"))
-    d = d.filter(((pl.col("rk") == 1) & (pl.col("p") >= t_any)) | ((pl.col("rk") > 1) & (pl.col("p") >= t_add)))
+    d = scored.with_columns(pl.col("p").rank("ordinal", descending=True).over("s1").alias("rk"),
+                            pl.col("p").max().over("s1").alias("p1"))
+    # abstain entirely unless the top candidate clears t_any; extras need p >= t_add
+    d = d.filter((pl.col("p1") >= t_any) & ((pl.col("rk") == 1) | (pl.col("p") >= t_add)))
     if resolve:
         d = d.filter(pl.col("p") == pl.col("p").max().over("m"))
     return d.select("s1", "m")
@@ -66,8 +74,8 @@ def decide(scored: pl.DataFrame, t_any: float, t_add: float, resolve: bool = Fal
 
 def tune(scored: pl.DataFrame, truth: pl.DataFrame, s1: pl.DataFrame, grid_any=None, grid_add=None) -> dict:
     """Grid search (t_any, t_add) on s1 (holdout half); returns best params and score."""
-    grid_any = grid_any or [0.02, 0.05, 0.1, 0.15, 0.2, 0.3, 0.4, 0.5]
-    grid_add = grid_add or [0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9]
+    grid_any = grid_any or GRID_ANY
+    grid_add = grid_add or GRID_ADD
     sc = scored.join(s1.select("s1"), on="s1")
     best = None
     for ta in grid_any:

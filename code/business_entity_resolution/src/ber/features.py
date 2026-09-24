@@ -213,8 +213,18 @@ def build(split: str, cand: pl.DataFrame, world_ids: pl.DataFrame, name: str) ->
                     path = f"{tmp}/{b0 + i}.parquet"
                     b.slice(i, CHUNK).write_parquet(path, compression="uncompressed")
                     pending.append(pool_.apply_async(_work, ((b0 + i, path),)))
-                # collect finished work while the next batch is prepared (bounded backlog)
-                while len(pending) > 4 * C.N_PROCS or (b0 + BATCH >= n and pending):
+                # collect finished work continuously (smooth progress/ETA); block only when the
+                # backlog is large, or at the very end
+                still = []
+                for r in pending:
+                    if r.ready():
+                        off, out = r.get()
+                        X[off:off + len(out)] = out
+                        prog.update(len(out))
+                    else:
+                        still.append(r)
+                pending = still
+                while len(pending) > 3 * C.N_PROCS or (b0 + BATCH >= n and pending):
                     off, out = pending.pop(0).get()
                     X[off:off + len(out)] = out
                     prog.update(len(out))

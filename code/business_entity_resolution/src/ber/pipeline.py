@@ -3,7 +3,7 @@
 Validation (train split):
   python -m ber.pipeline train --steps block,features,fit,eval
 Test inference + submission files:
-  python -m ber.pipeline test --steps block,features,predict,write
+  python -m ber.pipeline test --steps block,score,write
 
 Artifacts: cache/cand, cache/feats, cache/pred (parquet), models/, experiments/*.json,
 output/{matching_results,candidate_pairs}.tsv.
@@ -19,7 +19,7 @@ from . import config as C
 from .features import build as build_features
 from .io import load_source, load_train_pairs
 from .metrics import per_s1_f05, summarize
-from .model import decide, label, predict, train, tune, two_way
+from .model import GRID_ADD, GRID_ANY, decide, label, predict, train, tune, two_way
 from .progress import step
 from .run_blocking import run_test as block_test
 from .run_blocking import run_train as block_train
@@ -73,8 +73,8 @@ def train_eval():
         step("eval", f"world{w}: " + json.dumps({k: v["report"]["macro_f05"] for k, v in report[f"world{w}"].items()}))
     # final thresholds: best average over both worlds on the full holdout
     best = None
-    for ta in [0.02, 0.05, 0.1, 0.15, 0.2, 0.3, 0.4, 0.5]:
-        for tb in [0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9]:
+    for ta in GRID_ANY:
+        for tb in GRID_ADD:
             fs = [summarize(per_s1_f05(decide(scored_by_w[w], ta, tb), truth, hold))["macro_f05"] for w in (20, 0)]
             m = sum(fs) / 2
             if best is None or m > best[0]:
@@ -89,19 +89,22 @@ def train_eval():
     print(json.dumps(report, indent=2))
 
 
-def test_features():
+def test_score(parts: int = 4):
+    """Features + prediction in S1-partitioned parts (bounded memory; per-S1 context
+    features stay exact because every S1's candidates are in the same part)."""
+    booster = lgb.Booster(model_file=str(MODEL))
     cand = pl.read_parquet(C.CACHE / "cand" / "test.parquet")
     world = load_source("test", 1).select("entity_id")
-    f = build_features("test", cand, world, name="features test")
-    f.write_parquet(C.CACHE / "feats" / "test.parquet")
-
-
-def test_predict():
-    booster = lgb.Booster(model_file=str(MODEL))
-    f = pl.read_parquet(C.CACHE / "feats" / "test.parquet")
-    step("predict", f"scoring {f.height:,} test pairs")
-    scored = f.select("s1", "m").with_columns(pl.Series("p", predict(booster, f)))
+    cand = cand.with_columns((pl.col("s1").hash(seed=0) % parts).alias("_part"))
+    out = []
+    for k in range(parts):
+        ck = cand.filter(pl.col("_part") == k).drop("_part")
+        f = build_features("test", ck, world, name=f"features+score test part {k + 1}/{parts}")
+        out.append(f.select("s1", "m").with_columns(pl.Series("p", predict(booster, f))))
+        del f
+    scored = pl.concat(out)
     scored.write_parquet(C.CACHE / "pred" / "test.parquet")
+    step("score", f"test: scored {scored.height:,} pairs")
 
 
 def test_write():
@@ -135,7 +138,7 @@ if __name__ == "__main__":
     if a.split == "train":
         fns = {"block": lambda: block_train([20, 0]), "features": train_features, "fit": train_fit, "eval": train_eval}
     else:
-        fns = {"block": block_test, "features": test_features, "predict": test_predict, "write": test_write}
+        fns = {"block": block_test, "score": test_score, "write": test_write}
     for s in steps:
         step("pipeline", f"{a.split}: step {s} ...")
         fns[s]()
