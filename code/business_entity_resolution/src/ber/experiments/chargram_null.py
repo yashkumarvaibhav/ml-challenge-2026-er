@@ -36,10 +36,10 @@ def main(w: int = 20):
     nullp = pool.filter(pl.col("a_null") & (pl.col("n_str") != "")).rename({"entity_id": "m"})
     outs = []
     for cty in ("US", "India"):
-        w = r1.filter(pl.col("country") == cty)
+        wc = r1.filter(pl.col("country") == cty)
         q = nullp.filter(pl.col("country") == cty)
         vec = TfidfVectorizer(analyzer="char_wb", ngram_range=(3, 3), max_df=0.02, dtype=np.float32, sublinear_tf=True)
-        W = vec.fit_transform(w["n_str"].to_list())
+        W = vec.fit_transform(wc["n_str"].to_list())
         _G["WT"] = W.T.tocsr()
         _G["Q"] = vec.transform(q["n_str"].to_list()).tocsr()
         bounds = [(i, min(q.height, i + 2000)) for i in range(0, q.height, 2000)]
@@ -52,7 +52,7 @@ def main(w: int = 20):
         prog.done()
         g = pl.concat([pl.DataFrame({"qi": r.astype(np.int64), "wi": c.astype(np.int64), "cg": v, "r_cg": rk}) for r, c, v, rk in res])
         g = g.join(q.select(pl.col("m")).with_row_index("qi").with_columns(pl.col("qi").cast(pl.Int64)), on="qi") \
-             .join(w.select("s1").with_row_index("wi").with_columns(pl.col("wi").cast(pl.Int64)), on="wi").select("s1", "m", "cg", "r_cg")
+             .join(wc.select("s1").with_row_index("wi").with_columns(pl.col("wi").cast(pl.Int64)), on="wi").select("s1", "m", "cg", "r_cg")
         outs.append(g.join(hold, on="s1"))
     cg = pl.concat(outs)
     cg.write_parquet(C.CACHE / "dense" / f"holdout_w{w}_chargram_null.parquet")
