@@ -9,6 +9,10 @@ Per country, over normalized records (cache/norm_final):
   (d) core name S1 = pool : identical "core" name key (frequent words removed), only
                             for keys shared by <= KD pool records (address-null rescue)
   (e) reverse  pool -> S1 : each S2/S3 record's top KE S1s by combined score
+  (f) name+locality       : core name + one address word as an exact key (keys shared by
+                            <= KF_KEYCAP pool records), top KF by shared-key count
+  (g) null-addr reverse   : address-null pool records -> top KG S1s by name-only overlap
+                            with a higher df cap (DF_CAP_NREV)
 
 IDF / document frequency come from the split's own S2+S3 pool (label-free). Words
 with df above DF_CAP are ignored for retrieval (they still count in the features).
@@ -26,7 +30,9 @@ from . import config as C
 from .progress import Progress, step
 
 KA, KB, KC, KD, KE = 15, 15, 30, 30, 3
-CAP = 60
+KF, KF_KEYCAP = 20, 50
+KG, DF_CAP_NREV = 10, 30_000
+CAP = 70
 DF_CAP = 5000
 CORE_STOP_SHARE = 0.005  # name words used by > 0.5% of the country's S1 names are not "core"
 
@@ -98,7 +104,7 @@ def _fwd_chunk(bounds):
 def _rev_chunk(bounds):
     lo, hi = bounds
     S = (_G["RQ"][lo:hi] @ _G["S1T"]).tocsr()
-    r, c, v, rk = _topk_rows(S, KE)
+    r, c, v, rk = _topk_rows(S, _G.get("K_REV", KE))
     return hi - lo, (r + lo, c, v, rk)
 
 
@@ -124,8 +130,8 @@ def block_country(s1q: pl.DataFrame, s1_world: pl.DataFrame, pool: pl.DataFrame,
          .with_row_index("row").with_columns(pl.col("row").cast(I64)))
 
     pt = record_tokens(pool)
-    df = pt.group_by("tok").agg(pl.len().alias("df"), pl.col("kind").first())
-    df = df.filter(pl.col("df") <= DF_CAP).with_row_index("tid").with_columns(
+    df_all = pt.group_by("tok").agg(pl.len().alias("df"), pl.col("kind").first())
+    df = df_all.filter(pl.col("df") <= DF_CAP).with_row_index("tid").with_columns(
         (np.log(pool.height) - pl.col("df").log()).cast(pl.Float32).alias("idf"))
     V = df.height
     idf = df["idf"].to_numpy()
@@ -169,6 +175,30 @@ def block_country(s1q: pl.DataFrame, s1_world: pl.DataFrame, pool: pl.DataFrame,
     for k in ("RQ", "S1T"):
         _G.pop(k, None)
 
+    # (g) address-null pool records -> top KG S1s by name-only IDF overlap (higher df cap)
+    dfn = df_all.filter((pl.col("kind") == 0) & (pl.col("df") <= DF_CAP_NREV)).with_row_index("nid").with_columns(
+        (np.log(pool.height) - pl.col("df").log()).cast(pl.Float32).alias("idf"))
+    idfn = dfn["idf"].to_numpy()
+    nullp = pool.filter(pl.col("a_tok").list.len() == 0).select("row", "n_tok").with_row_index("nrow") \
+        .with_columns(pl.col("nrow").cast(I64))
+    gch = pl.DataFrame(schema={"prow": I64, "qrow": I64, "r_g": pl.Int16})
+    if nullp.height:
+        pnt = (nullp.select(pl.col("nrow").alias("row"), pl.col("n_tok").list.unique().alias("tok")).explode("tok")
+               .with_columns(("n:" + pl.col("tok")).alias("tok")).join(dfn.select("tok", "nid"), on="tok")
+               .rename({"nid": "tid"}))
+        wnt = (world.select("row", pl.col("n_tok").list.unique().alias("tok")).explode("tok")
+               .with_columns(("n:" + pl.col("tok")).alias("tok")).join(dfn.select("tok", "nid"), on="tok")
+               .rename({"nid": "tid"}))
+        _G["RQ"] = _csr(pnt, nullp.height, dfn.height, idfn[pnt["tid"].to_numpy()])
+        _G["S1T"] = _csr(wnt, world.height, dfn.height).T.tocsr()
+        _G["K_REV"] = KG
+        gparts = _run_pool(_rev_chunk, nullp.height, 2000, f"block {cty} null-address reverse")
+        for k in ("RQ", "S1T", "K_REV"):
+            _G.pop(k, None)
+        g = pl.concat([pl.DataFrame({"nrow": r.astype(np.int64), "wrow": c.astype(np.int64), "r_g": rk}) for r, c, v, rk in gparts])
+        gch = (g.join(nullp.select("nrow", pl.col("row").alias("prow")), on="nrow")
+               .join(q.select(pl.col("row").alias("qrow"), "wrow"), on="wrow").select("prow", "qrow", "r_g"))
+
     # (d) core-name key equality, for keys shared by <= KD pool records
     s1w = world.select("n_tok")
     stop = (s1w.explode("n_tok").group_by("n_tok").len()
@@ -185,8 +215,24 @@ def block_country(s1q: pl.DataFrame, s1_world: pl.DataFrame, pool: pl.DataFrame,
     dch = qc.select(pl.col("row").alias("qrow"), "core").join(
         pc.select(pl.col("row").alias("prow"), "core"), on="core").drop("core").with_columns(pl.lit(True).alias("in_d"))
 
+    # (f) name + locality keys
+    def nl_keys(d):
+        return (core(d.select("row", "n_tok", "a_tok")).filter(pl.col("core") != "")
+                .select("row", "core", pl.col("a_tok").list.unique().alias("t")).explode("t")
+                .filter(pl.col("t").is_not_null() & (pl.col("t").str.len_chars() >= 3) & ~pl.col("t").str.contains(r"^[0-9]+$"))
+                .select("row", (pl.col("core") + "|" + pl.col("t")).alias("k")))
+
+    pk = nl_keys(pool)
+    pk = pk.join(pk.group_by("k").len().filter(pl.col("len") <= KF_KEYCAP).select("k"), on="k")
+    fch = (nl_keys(q).rename({"row": "qrow"}).join(pk.rename({"row": "prow"}), on="k")
+           .group_by("qrow", "prow").agg(pl.len().alias("n_f"))
+           .with_columns(pl.col("n_f").rank("ordinal", descending=True).over("qrow").cast(pl.Int16).alias("r_f"))
+           .filter(pl.col("r_f") <= KF).drop("n_f"))
+
     cand = (cand.join(rev, on=["qrow", "prow"], how="full", coalesce=True)
-            .join(dch, on=["qrow", "prow"], how="full", coalesce=True))
+            .join(dch, on=["qrow", "prow"], how="full", coalesce=True)
+            .join(fch, on=["qrow", "prow"], how="full", coalesce=True)
+            .join(gch, on=["qrow", "prow"], how="full", coalesce=True))
     big = 10_000
     cand = cand.with_columns(
         pl.min_horizontal(
@@ -195,13 +241,15 @@ def block_country(s1q: pl.DataFrame, s1_world: pl.DataFrame, pool: pl.DataFrame,
             pl.col("r_c").cast(pl.Int32).fill_null(big),
             pl.when(pl.col("r_e").is_not_null()).then(pl.col("r_e").cast(pl.Int32)).otherwise(big),
             pl.when(pl.col("in_d")).then(pl.lit(KD // 2)).otherwise(big),
+            pl.col("r_f").cast(pl.Int32).fill_null(big),
+            pl.col("r_g").cast(pl.Int32).fill_null(big),
         ).alias("prio"),
         pl.col("in_d").fill_null(False),
     ).sort(["qrow", "prio", "s_c"], descending=[False, False, True], nulls_last=True)
     cand = cand.with_columns(pl.col("prio").rank("ordinal").over("qrow").alias("pos")).filter(pl.col("pos") <= CAP)
     out = (cand.join(q.select(pl.col("row").alias("qrow"), pl.col("entity_id").alias("s1")), on="qrow")
            .join(pool.select(pl.col("row").alias("prow"), pl.col("entity_id").alias("m")), on="prow")
-           .select("s1", "m", "s_a", "s_b", "s_c", "r_a", "r_b", "r_c", "r_e", "in_d", "prio"))
+           .select("s1", "m", "s_a", "s_b", "s_c", "r_a", "r_b", "r_c", "r_e", "in_d", "r_f", "r_g", "prio"))
     step(f"block {cty}", f"DONE {out.height:,} pairs ({out.height / max(1, q.height):.1f}/S1) in {time.time() - t0:.0f}s")
     return out
 
