@@ -24,8 +24,13 @@ from .progress import step
 from .run_blocking import run_test as block_test
 from .run_blocking import run_train as block_train
 
+import os
+
 MODEL = C.ROOT / "models" / f"lgb_{C.RUN}.txt"
-DECISION = C.EXPERIMENTS / "decision_params.json"
+# the final scores / thresholds can be overridden (e.g. stage 2 + cross-encoder):
+#   BER_TEST_PRED=cache/s2/test_pred.parquet BER_DECISION=experiments/decision_params_s2ce.json
+DECISION = C.ROOT / os.environ["BER_DECISION"] if "BER_DECISION" in os.environ else C.EXPERIMENTS / "decision_params.json"
+TEST_PRED = C.ROOT / os.environ["BER_TEST_PRED"] if "BER_TEST_PRED" in os.environ else C.CACHE / "pred" / "test.parquet"
 
 
 def _split():
@@ -113,7 +118,7 @@ def test_score(parts: int = 4):
 
 def test_write():
     params = json.loads(DECISION.read_text())
-    scored = pl.read_parquet(C.CACHE / "pred" / "test.parquet")
+    scored = pl.read_parquet(TEST_PRED)
     cand = pl.read_parquet(C.CACHE / "cand" / "test.parquet").select("s1", "m")
     s1 = load_source("test", 1).select(pl.col("entity_id").alias("s1"))
     pred = decide(scored, params["t_any"], params["t_add"])
