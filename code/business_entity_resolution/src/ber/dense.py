@@ -12,7 +12,7 @@ index (approximate nearest neighbours: sub-linear per query, so blocking scales)
 Leakage-safe split: the bi-encoder trains only on training-portion S1s that are NOT in the stage-1
 (v4) sample, the stage-2 fit sample, the CE sample (a subset of the v4 sample) or the holdout.
 
-  python -m ber.dense --steps data,tokenize,train,encode,evalrecall
+  python -m ber.dense --steps data,tokenize,train,encode,ann_check,recall_report
 """
 import argparse
 import json
@@ -146,14 +146,14 @@ def train():
     nb = len(a) // BATCH
     order = np.random.default_rng(C.SEED + 1).permutation(nb)
     model = Encoder().to(dev)
-    model.enc.gradient_checkpointing_enable() if BATCH > 2048 else None
+    model.enc.gradient_checkpointing_enable()  # 3 x BATCH sequences per step do not fit in 48 GB otherwise
     opt = torch.optim.AdamW(model.parameters(), lr=LR, weight_decay=0.01)
     warm = max(1, int(0.05 * nb))
     sched = torch.optim.lr_scheduler.LambdaLR(opt, lambda s: min((s + 1) / warm, max(0.0, (nb - s) / (nb - warm))))
     ce = torch.nn.CrossEntropyLoss()
     model.train()
     prog = Progress("dense train e5-small (A6000)", nb * BATCH, unit="pairs")
-    run = 0.0
+    run, n_same = 0.0, 0
     for i, b in enumerate(order):
         sl = slice(b * BATCH, (b + 1) * BATCH)
         xa, ma = _gather(s1tok, s1len, a[sl], dev)
@@ -162,7 +162,13 @@ def train():
             ea = model(xa, ma)
             ep = model(xp, mp_)
         tgt = torch.arange(BATCH, device=dev)
-        loss = 0.5 * (ce(ea @ ep.T / TEMP, tgt) + ce(ep[:BATCH] @ ea.T / TEMP, tgt))
+        # other positives of the same S1 in this batch are not negatives (reviewer 16:50 UTC): mask them
+        aid = torch.from_numpy(a[sl]).to(dev)
+        same = (aid[:, None] == aid[None, :]) & ~torch.eye(BATCH, dtype=torch.bool, device=dev)
+        n_same += int(same.sum().item())
+        l_fwd = torch.cat([(ea @ ep[:BATCH].T / TEMP).masked_fill(same, -1e4), ea @ ep[BATCH:].T / TEMP], dim=1)
+        l_rev = (ep[:BATCH] @ ea.T / TEMP).masked_fill(same, -1e4)
+        loss = 0.5 * (ce(l_fwd, tgt) + ce(l_rev, tgt))
         opt.zero_grad(set_to_none=True)
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
@@ -171,7 +177,7 @@ def train():
         run = 0.98 * run + 0.02 * loss.item() if i else loss.item()
         prog.update(BATCH)
         if i % 200 == 0:
-            step("dense", f"step {i}/{nb} loss {run:.4f} lr {sched.get_last_lr()[0]:.2e}")
+            step("dense", f"step {i}/{nb} loss {run:.4f} lr {sched.get_last_lr()[0]:.2e} masked same-S1 pairs so far {n_same}")
     prog.done()
     OUT.mkdir(parents=True, exist_ok=True)
     torch.save(model.state_dict(), OUT / "model.pt")
@@ -262,48 +268,119 @@ def retrieve(split: str, query_ids: pl.DataFrame, world_ids: pl.DataFrame, k_fwd
     return pl.concat(outs)
 
 
-def evalrecall():
-    """Holdout (20% world) recall vs candidate budget: dense alone, and dense + current channels."""
+def ann_check(n_q: int = 4000, k: int = 50):
+    """IVF vs exact cosine top-k from the SAME embeddings on a fixed holdout query sample (per country),
+    for several nprobe values: separates embedding quality from approximate-index loss."""
+    import faiss
     sp = pl.read_parquet(C.CACHE / "splits" / "train_s1_split.parquet")
-    hold = sp.filter(pl.col("is_holdout") & ~pl.col("is_ghost")).select(pl.col("entity_id").alias("s1"), "country")
-    world = sp.filter(~pl.col("is_ghost")).select("entity_id")
-    dc = retrieve("train", hold.select(pl.col("s1").alias("entity_id")), world)
-    dc.write_parquet(DATA / "holdout_w20_dense.parquet")
-    truth = load_train_pairs().select("s1", "m").join(hold, on="s1").with_columns(pl.lit(1).alias("y"))
-    old = pl.read_parquet(C.CACHE / "cand" / "train_w20.parquet").join(hold.select("s1"), on="s1")
-    rep = {"truth_pairs": truth.height, "old_recall_cap70": old.join(truth, on=["s1", "m"]).height / truth.height,
-           "old_per_s1": old.height / hold.height}
-    d = dc.join(truth.select("s1", "m", "y"), on=["s1", "m"], how="left").with_columns(pl.col("y").fill_null(0))
-    for kf in (5, 10, 15, 20, 30, 50):
-        for kr in (0, 1, 2, 3, 5, 10):
-            x = d.filter((pl.col("r_df") <= kf) | (pl.col("r_dr") <= kr))
-            rep[f"dense fwd{kf} rev{kr}"] = {"recall": round(x["y"].sum() / truth.height, 4), "per_s1": round(x.height / hold.height, 2)}
-    # budgeted: rank all dense candidates by cosine, cap K per S1
-    r = d.sort(["s1", "d_cos"], descending=[False, True]).with_columns(pl.int_range(1, pl.len() + 1).over("s1").alias("pos"))
-    for K in (5, 8, 10, 12, 15, 20, 25, 30):
-        x = r.filter(pl.col("pos") <= K)
-        rep[f"dense by-cosine cap{K}"] = {"recall": round(x["y"].sum() / truth.height, 4), "per_s1": round(x.height / hold.height, 2)}
-    # union with the old rule channels (h, j exact keys only) and with everything
-    hj = old.filter(pl.col("r_h").is_not_null() | pl.col("r_j").is_not_null()).select("s1", "m")
-    for K in (10, 15, 20):
-        x = r.filter(pl.col("pos") <= K).select("s1", "m")
-        u = pl.concat([x, hj]).unique()
-        rep[f"dense cap{K} + h/j keys"] = {"recall": round(u.join(truth, on=["s1", "m"]).height / truth.height, 4), "per_s1": round(u.height / hold.height, 2)}
-        u2 = pl.concat([x, old.select("s1", "m")]).unique()
-        rep[f"dense cap{K} + all old"] = {"recall": round(u2.join(truth, on=["s1", "m"]).height / truth.height, 4), "per_s1": round(u2.height / hold.height, 2)}
-    # which old misses does dense recover?
-    status = pl.read_parquet(C.CACHE / "diag_holdout_truth_status.parquet") if (C.CACHE / "diag_holdout_truth_status.parquet").exists() else None
-    if status is not None:
-        nc = status.filter(pl.col("st") == "not_cand").select("s1", "m")
-        rep["old_not_cand_recovered_by_dense_cap20"] = round(nc.join(r.filter(pl.col("pos") <= 20).select("s1", "m"), on=["s1", "m"]).height / max(1, nc.height), 4)
-    by_c = {}
-    x = r.filter(pl.col("pos") <= 15).join(hold, on="s1")
+    hold = sp.filter(pl.col("is_holdout") & ~pl.col("is_ghost"))
+    s1ids = pl.read_parquet(DATA / "ids_train_s1.parquet").with_row_index("i")
+    pids = pl.read_parquet(DATA / "ids_train_pool.parquet").with_row_index("j")
+    E1, EP = np.load(EMB / "train_s1.npy", mmap_mode="r"), np.load(EMB / "train_pool.npy", mmap_mode="r")
+    rep = {}
     for cty in ("US", "India"):
-        tc = truth.filter(pl.col("country") == cty).height
-        by_c[cty] = round(x.filter((pl.col("country") == cty) & (pl.col("y") == 1)).height / tc, 4)
-    rep["dense cap15 recall by country"] = by_c
-    (C.EXPERIMENTS / "dense_recall_w20.json").write_text(json.dumps(rep, indent=1))
-    step("dense", "evalrecall: " + json.dumps({k: v for k, v in rep.items() if "cap" in k or "old" in k}))
+        q = s1ids.join(hold.select("entity_id"), on="entity_id").filter(pl.col("country") == cty).sample(n_q, seed=C.SEED)
+        XQ = np.ascontiguousarray(E1[q["i"].to_numpy()], dtype=np.float32)
+        XP = np.ascontiguousarray(EP[pids.filter(pl.col("country") == cty)["j"].to_numpy()], dtype=np.float32)
+        best_v = np.full((len(XQ), k), -9.0, np.float32)
+        best_i = np.zeros((len(XQ), k), np.int64)
+        for b0 in range(0, len(XP), 500_000):
+            S = XQ @ XP[b0:b0 + 500_000].T
+            v = np.concatenate([best_v, S], 1)
+            i = np.concatenate([best_i, np.arange(b0, b0 + S.shape[1])[None, :].repeat(len(XQ), 0)], 1)
+            top = np.argpartition(-v, k, axis=1)[:, :k]
+            best_v, best_i = np.take_along_axis(v, top, 1), np.take_along_axis(i, top, 1)
+        o = np.argsort(-best_v, 1)
+        exact = np.take_along_axis(best_i, o, 1)
+        index = _ivf(XP)
+        for nprobe in (16, 32, 64, 128):
+            index.nprobe = nprobe
+            _, I = index.search(XQ, k)
+            for kk in (10, 20, 50):
+                ov = np.mean([len(set(exact[r, :kk]) & set(I[r, :kk])) / kk for r in range(len(XQ))])
+                rep[f"{cty} nprobe{nprobe} overlap@{kk}"] = round(float(ov), 4)
+    (C.EXPERIMENTS / "dense_ann_check.json").write_text(json.dumps(rep, indent=1))
+    step("dense", "ann_check: " + json.dumps(rep))
+
+
+def _union(dc, old, KF, KR, CAP, with_hj):
+    """Production-style candidate set: dense forward <= KF, dense reverse <= KR, optionally the exact
+    name+number keys (h, j <= 10); ordered by best channel rank then cosine; final cap CAP per S1."""
+    big = 10_000
+    d = dc.filter((pl.col("r_df") <= KF) | (pl.col("r_dr") <= KR)).with_columns(
+        pl.when(pl.col("r_df") <= KF).then(pl.col("r_df")).otherwise(None).alias("r_df"),
+        pl.when(pl.col("r_dr") <= KR).then(pl.col("r_dr")).otherwise(None).alias("r_dr"))
+    if with_hj:
+        hj = old.filter(pl.col("r_h").is_not_null() | pl.col("r_j").is_not_null()).select("s1", "m", "r_h", "r_j")
+        d = d.join(hj, on=["s1", "m"], how="full", coalesce=True)
+    else:
+        d = d.with_columns(pl.lit(None, pl.Int16).alias("r_h"), pl.lit(None, pl.Int16).alias("r_j"))
+    d = d.with_columns(pl.min_horizontal([pl.col(c).cast(pl.Int32).fill_null(big) for c in ("r_df", "r_dr", "r_h", "r_j")]).alias("pri"))
+    d = d.sort(["s1", "pri", "d_cos"], descending=[False, False, True], nulls_last=True) \
+        .with_columns(pl.int_range(1, pl.len() + 1).over("s1").alias("pos")).filter(pl.col("pos") <= CAP)
+    return d.select("s1", "m")
+
+
+def recall_report(worlds=(20, 0)):
+    """Reviewer 16:50 UTC: evaluate the EXACT final-capped union (dedup + per-S1 cap), mean/p95/max per S1,
+    pair recall, oracle macro-F0.5 (all / half A / half B), country / address-null / native-script recall,
+    true matches rescued vs displaced relative to the old rule-based set; both ghost worlds."""
+    from .metrics import blocking_report
+    from .run_blocking import mflags
+    sp = pl.read_parquet(C.CACHE / "splits" / "train_s1_split.parquet")
+    hold = sp.filter(pl.col("is_holdout") & ~pl.col("is_ghost")).select(pl.col("entity_id").alias("s1"), "country", "holdout_half")
+    s1c = hold.select("s1", "country")
+    truth = load_train_pairs().select("s1", "m").join(hold.select("s1"), on="s1")
+    flags = mflags("train")
+    rep = {}
+
+    def stats(c, tag, halves=False):
+        cc = c.join(hold.select("s1"), on="s1")
+        per = hold.select("s1").join(cc.group_by("s1").len(), on="s1", how="left").fill_null(0)["len"]
+        r = blocking_report(cc, truth, s1c, flags)
+        out = {"mean_per_s1": round(float(per.mean()), 2), "p95_per_s1": int(per.quantile(0.95)), "max_per_s1": int(per.max()),
+               "pair_recall": r["pair_recall"], "oracle": r["oracle"]["macro_f05"], "by_country": r["by_country_recall"],
+               "addr_null_recall": r["segment_address_null"]["recall"], "native_recall": r["segment_native_name"]["recall"]}
+        if halves:
+            for h in ("A", "B"):
+                hs = hold.filter(pl.col("holdout_half") == h).select("s1", "country")
+                out[f"oracle_half{h}"] = blocking_report(cc.join(hs.select("s1"), on="s1"), truth, hs, flags)["oracle"]["macro_f05"]
+        return out
+
+    for w in worlds:
+        world = (sp.filter(~pl.col("is_ghost")) if w == 20 else sp).select("entity_id")
+        path = DATA / f"holdout_w{w}_dense.parquet"
+        if path.exists():
+            dc = pl.read_parquet(path)
+        else:
+            dc = retrieve("train", hold.select(pl.col("s1").alias("entity_id")), world)
+            dc.write_parquet(path)
+        old = pl.read_parquet(C.CACHE / "cand" / f"train_w{w}.parquet").join(hold.select("s1"), on="s1")
+        oldt = old.select("s1", "m").join(truth, on=["s1", "m"])
+        rep[f"w{w} old rule-based (cap 70)"] = stats(old.select("s1", "m"), "old", halves=True)
+        rows = []
+        for KF in (10, 20, 30):
+            for KR in (2, 5):
+                for with_hj in (False, True):
+                    for CAP in (15, 20, 25, 30, 40):
+                        u = _union(dc, old, KF, KR, CAP, with_hj)
+                        st = stats(u, "")
+                        ut = u.join(truth, on=["s1", "m"])
+                        st["rescued_vs_old"] = ut.join(oldt, on=["s1", "m"], how="anti").height
+                        st["displaced_vs_old"] = oldt.join(ut, on=["s1", "m"], how="anti").height
+                        key = f"w{w} dense fwd{KF} rev{KR}{' +h/j' if with_hj else ''} cap{CAP}"
+                        rep[key] = st
+                        rows.append((key, st))
+                        step("dense", f"{key}: mean {st['mean_per_s1']}/S1 recall {st['pair_recall']} oracle {st['oracle']}")
+        # halves for the best config at each cap (Pareto shortlist)
+        for CAP in (15, 20, 25, 30, 40):
+            key, _ = max([(k, s) for k, s in rows if k.endswith(f"cap{CAP}")], key=lambda x: x[1]["oracle"])
+            KF, KR = int(key.split("fwd")[1].split()[0]), int(key.split("rev")[1].split()[0])
+            rep[key].update({k: v for k, v in stats(_union(dc, old, KF, KR, CAP, "+h/j" in key), "", halves=True).items() if k.startswith("oracle_half")})
+            rep[f"w{w} best at cap{CAP}"] = key
+        (C.EXPERIMENTS / "dense_recall_report.json").write_text(json.dumps(rep, indent=1))
+    step("dense", "recall_report: " + json.dumps({k: (v if isinstance(v, str) else {x: v.get(x) for x in ("mean_per_s1", "pair_recall", "oracle", "oracle_halfA", "oracle_halfB")})
+                                                  for k, v in rep.items() if "old" in k or "best" in k or isinstance(v, str)}))
 
 
 if __name__ == "__main__":
@@ -313,5 +390,5 @@ if __name__ == "__main__":
     t0 = time.time()
     for s in a.steps.split(","):
         step("dense", f"step {s} ...")
-        {"data": data, "tokenize": tokenize, "train": train, "encode": encode, "evalrecall": evalrecall}[s]()
+        {"data": data, "tokenize": tokenize, "train": train, "encode": encode, "ann_check": ann_check, "recall_report": recall_report}[s]()
     step("dense", f"steps {a.steps} DONE in {time.time() - t0:.0f}s")
