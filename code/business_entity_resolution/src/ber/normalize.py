@@ -87,6 +87,16 @@ def run(stage: str, split: str):
     maps = None
     if stage == "final":
         maps = json.loads((C.CACHE / "maps" / "maps.json").read_text())
+        # self-trained maps (pseudo-pairs from the split's own predictions; FAQ: self-training allowed)
+        # add countries that have no supervised maps (France); supervised countries are never overridden
+        self_path = C.CACHE / "maps" / f"self_maps_{split}.json"
+        if self_path.exists():
+            sm = json.loads(self_path.read_text())
+            for kind in ("addr_comp", "addr_tok", "name_tok"):
+                for cty, m in sm.get(kind, {}).items():
+                    maps.setdefault(kind, {}).setdefault(cty, {})
+                    if not maps[kind][cty]:
+                        maps[kind][cty] = m
     outdir = C.CACHE / f"norm_{stage}"
     outdir.mkdir(parents=True, exist_ok=True)
     seg = None
