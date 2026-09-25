@@ -29,7 +29,7 @@ import os
 MODEL = C.ROOT / "models" / f"lgb_{C.RUN}.txt"
 # the final scores / thresholds can be overridden (e.g. stage 2 + cross-encoder):
 #   BER_TEST_PRED=cache/s2/test_pred.parquet BER_DECISION=experiments/decision_params_s2ce.json
-DECISION = C.ROOT / os.environ["BER_DECISION"] if "BER_DECISION" in os.environ else C.EXPERIMENTS / "decision_params.json"
+DECISION = C.ROOT / os.environ["BER_DECISION"] if "BER_DECISION" in os.environ else C.EXP_RUN / "decision_params.json"
 TEST_PRED = C.ROOT / os.environ["BER_TEST_PRED"] if "BER_TEST_PRED" in os.environ else C.WORK / "pred" / "test.parquet"
 
 
@@ -58,7 +58,7 @@ def train_fit():
     MODEL.parent.mkdir(parents=True, exist_ok=True)
     booster.save_model(str(MODEL), num_iteration=booster.best_iteration)
     imp = sorted(zip(booster.feature_name(), booster.feature_importance("gain")), key=lambda x: -x[1])
-    (C.EXPERIMENTS / "b4_importance.json").write_text(json.dumps([(n, round(g, 1)) for n, g in imp], indent=1))
+    (C.EXP_RUN / "b4_importance.json").write_text(json.dumps([(n, round(g, 1)) for n, g in imp], indent=1))
 
 
 def train_eval():
@@ -92,7 +92,7 @@ def train_eval():
     for w in (20, 0):
         report[f"world{w}_full_holdout_at_final_params"] = summarize(
             per_s1_f05(decide(scored_by_w[w], params["t_any"], params["t_add"]), truth, hold))
-    (C.EXPERIMENTS / "b5_holdout_eval.json").write_text(json.dumps(report, indent=2))
+    (C.EXP_RUN / "b5_holdout_eval.json").write_text(json.dumps(report, indent=2))
     print(json.dumps(report, indent=2))
 
 

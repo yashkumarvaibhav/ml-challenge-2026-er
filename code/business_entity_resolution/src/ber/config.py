@@ -28,6 +28,8 @@ RUN = os.environ.get("BER_RUN", "v2")
 # directly; BER_WORK=v6 keeps a new run's artifacts in cache/v6/ so earlier packages stay reproducible.
 WORK = CACHE / os.environ["BER_WORK"] if os.environ.get("BER_WORK") else CACHE
 V6 = RUN == "v6"  # dense-retrieval blocking (ber.blocking_v6) and its blocking feature columns
+EXP_RUN = EXPERIMENTS / RUN if V6 else EXPERIMENTS  # v6 reports go to experiments/v6/ (v1-v5 reports untouched)
+EXP_RUN.mkdir(parents=True, exist_ok=True)
 
 # Default CPU budget; override BER_PROCS for the local machine.
 N_PROCS = int(os.environ.get("BER_PROCS", "96"))

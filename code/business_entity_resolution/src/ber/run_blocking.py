@@ -53,7 +53,7 @@ def run_train(worlds):
         rep = blocking_report(cand, truth, s1, flags)
         rep["runtime_sec"] = round(time.time() - t0)
         rep["world"] = f"{w}% ghosts"
-        (C.EXPERIMENTS / f"b2_blocking_w{w}.json").write_text(json.dumps(rep, indent=2))
+        (C.EXP_RUN / f"b2_blocking_w{w}.json").write_text(json.dumps(rep, indent=2))
         step("run_blocking", f"world{w} holdout report: " + json.dumps({k: rep[k] for k in ("pair_recall", "oracle", "pairs_per_s1")}))
         print(json.dumps(rep, indent=2), flush=True)
 

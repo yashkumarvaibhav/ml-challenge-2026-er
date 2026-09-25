@@ -88,6 +88,13 @@ def _read_parts(w, s1_filter: pl.DataFrame = None, cols=None):
     return pl.concat(parts)
 
 
+def _not_bienc() -> pl.DataFrame:
+    """Training-portion S1s outside the bi-encoder training set = v4 (stage-1) sample + stage-2 fit sample."""
+    tr = _split().filter(pl.col("is_train"))
+    return pl.concat([tr.sample(400_000, seed=C.SEED).select(pl.col("entity_id").alias("s1")),
+                      tr.select(pl.col("entity_id").alias("s1")).sample(S2_TRAIN_S1, seed=C.SEED + 99)]).unique()
+
+
 def oof(w: int):
     """Stage-1 scores: out-of-fold for training-portion S1s, v4 model for every other world S1."""
     sp = _split().filter(~pl.col("is_ghost")) if w == 20 else _split()
@@ -97,7 +104,10 @@ def oof(w: int):
     scored = []
     for f in range(N_FOLDS):
         step("stage2", f"OOF fold {f + 1}/{N_FOLDS}: training ...")
-        others = tr.filter(pl.col("fold") != f).select("s1").sample(FOLD_TRAIN_S1, seed=C.SEED + f)
+        pool_f = tr.filter(pl.col("fold") != f).select("s1")
+        if C.V6:  # d_cos is in-sample for bi-encoder training S1s: fold models train only on S1s it never saw
+            pool_f = pool_f.join(_not_bienc(), on="s1")
+        others = pool_f.sample(min(FOLD_TRAIN_S1, pool_f.height), seed=C.SEED + f)
         d = _read_parts(w, others, ["s1", "m"] + FEATURES).join(truth, on=["s1", "m"], how="left").with_columns(pl.col("y").fill_null(0))
         es_s1 = d.select("s1").unique().sort("s1").sample(fraction=0.1, seed=C.SEED)
         es, trn = d.join(es_s1, on="s1"), d.join(es_s1, on="s1", how="anti")
@@ -241,7 +251,7 @@ def fit(w: int = 20):
     step("stage2", f"fit: best iteration {booster.best_iteration}")
     booster.save_model(str(MODEL_S2), num_iteration=booster.best_iteration)
     imp = sorted(zip(booster.feature_name(), booster.feature_importance("gain")), key=lambda x: -x[1])
-    (C.EXPERIMENTS / "s2_importance.json").write_text(json.dumps([(n, round(g, 1)) for n, g in imp], indent=1))
+    (C.EXP_RUN / "s2_importance.json").write_text(json.dumps([(n, round(g, 1)) for n, g in imp], indent=1))
 
 
 def evaluate(w: int = 20):
@@ -261,7 +271,7 @@ def evaluate(w: int = 20):
             if best is None or f > best[0]:
                 best = (f, ta, tb)
     rep["final_params"] = {"t_any": best[1], "t_add": best[2], "holdout_f05": best[0]}
-    (C.EXPERIMENTS / f"s2_eval_w{w}.json").write_text(json.dumps(rep, indent=2))
+    (C.EXP_RUN / f"s2_eval_w{w}.json").write_text(json.dumps(rep, indent=2))
     s2.write_parquet(S2 / f"holdout_pred_w{w}.parquet")
     step("stage2", "eval w%d: stage2 %s | stage1 same universe %s | final %s" % (
         w, {k: v["report"]["macro_f05"] for k, v in rep["stage2"].items()},
