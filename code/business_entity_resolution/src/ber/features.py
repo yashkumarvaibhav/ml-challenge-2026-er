@@ -36,7 +36,7 @@ FEATURES = [
     # record flags (S2/S3 side) + source
     "m_native", "m_native_mapped", "m_allcaps", "m_accent", "m_domain", "m_dba", "m_is_s3",
     # blocking
-    "s_a", "s_b", "s_c", "r_a", "r_b", "r_c", "r_e", "in_d", "r_f", "r_g", "r_h", "prio",
+    "s_a", "s_b", "s_c", "r_a", "r_b", "r_c", "r_e", "in_d", "r_f", "r_g", "r_h", "r_j", "prio",
     # context (label-free)
     "amb_s1_core", "amb_pool_core", "c_n_cand", "c_sc_rel", "c_sc_rank",
 ]
@@ -116,7 +116,7 @@ def _pair_feats(r1, r2, blk, ctx, nidf, aidf, ndef, adef):
 
 REC_COLS = ["country", "n_tok", "a_tok", "a_comp", "a_nums", "n_native", "n_native_mapped_frac", "n_allcaps",
             "n_accent", "n_domain", "n_dba", "a_null", "a_ncomma"]
-BLK_COLS = ["s_a", "s_b", "s_c", "r_a", "r_b", "r_c", "r_e", "in_d", "r_f", "r_g", "r_h", "prio"]
+BLK_COLS = ["s_a", "s_b", "s_c", "r_a", "r_b", "r_c", "r_e", "in_d", "r_f", "r_g", "r_h", "r_j", "prio"]
 CTX_COLS = ["amb_s1_core", "amb_pool_core", "c_n_cand", "c_sc_rel", "c_sc_rank"]
 
 
