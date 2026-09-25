@@ -24,6 +24,7 @@ Steps (world20 = ghosts removed; resumable):
 """
 import argparse
 import json
+import os
 import time
 
 import lightgbm as lgb
@@ -51,7 +52,9 @@ S2_FEATURES = ["p1", "lp1", "m_best_other", "m_gap", "m_rank", "m_n_hi", "m_n_ca
 CE_BAND = (0.01, 0.995)
 CE_FEATURES = ["ce", "ce_minus_p1"]
 MODEL_V4 = C.ROOT / "models" / ("lgb_v6.txt" if C.V6 else "lgb_v4.txt")  # the stage-1 model of this run
-MODEL_S2 = C.ROOT / "models" / ("lgb_s2_v6.txt" if C.V6 else "lgb_s2.txt")
+# CE variant (BER_CE, see ber.cross_encoder): non-default CEs get their own score files, stage-2 model and reports
+SFX = "" if os.environ.get("BER_CE", "e5small") == "e5small" else "_" + os.environ["BER_CE"]
+MODEL_S2 = C.ROOT / "models" / (("lgb_s2_v6" if C.V6 else "lgb_s2") + SFX + ".txt")
 
 
 def _split():
@@ -179,14 +182,14 @@ def ce_train_universe(w: int):
     hold = sp.filter(pl.col("is_holdout")).select(pl.col("entity_id").alias("s1"))
     rows = st.join(pl.concat([fit_s1, hold]).unique(), on="s1").select("s1", "m")
     step("stage2", f"CE scoring {rows.height:,} band pairs (fit sample + holdout) ...")
-    rows.with_columns(pl.Series("ce", score(rows, "train", name=f"ce score train band w{w}"))).write_parquet(S2 / f"ce_w{w}.parquet")
+    rows.with_columns(pl.Series("ce", score(rows, "train", name=f"ce score train band w{w}"))).write_parquet(S2 / f"ce_w{w}{SFX}.parquet")
 
 
 def ce_test():
     from .cross_encoder import score
     st = pl.read_parquet(C.WORK / "pred" / "test.parquet").filter(pl.col("p").is_between(*CE_BAND)).select("s1", "m")
     step("stage2", f"CE scoring {st.height:,} test band pairs ...")
-    st.with_columns(pl.Series("ce", score(st, "test", name="ce score test band"))).write_parquet(S2 / "ce_test.parquet")
+    st.with_columns(pl.Series("ce", score(st, "test", name="ce score test band"))).write_parquet(S2 / f"ce_test{SFX}.parquet")
 
 
 def _with_ce(d: pl.DataFrame, ce_path) -> pl.DataFrame:
@@ -235,7 +238,7 @@ def s2feats(w: int):
     _assert_coverage(st, w)
     cand = pl.read_parquet(C.WORK / "cand" / f"train_full_w{w}.parquet")
     step("stage2", f"competition features over {st.height:,} pairs ...")
-    _with_ce(s2_features(st, cand, _a_null("train")), S2 / f"ce_w{w}.parquet").write_parquet(S2 / f"s2feats_w{w}.parquet")
+    _with_ce(s2_features(st, cand, _a_null("train")), S2 / f"ce_w{w}{SFX}.parquet").write_parquet(S2 / f"s2feats_w{w}{SFX}.parquet")
 
 
 def _feat_list(d: pl.DataFrame):
@@ -243,7 +246,7 @@ def _feat_list(d: pl.DataFrame):
 
 
 def fit(w: int = 20):
-    d = pl.read_parquet(S2 / f"s2feats_w{w}.parquet")
+    d = pl.read_parquet(S2 / f"s2feats_w{w}{SFX}.parquet")
     FEATS = _feat_list(d)
     step("stage2", f"fit features: {len(FEATS)} ({'with' if 'ce' in FEATS else 'without'} cross-encoder)")
     truth = load_train_pairs().select("s1", "m").with_columns(pl.lit(1, pl.Int8).alias("y"))
@@ -261,11 +264,11 @@ def fit(w: int = 20):
     step("stage2", f"fit: best iteration {booster.best_iteration}")
     booster.save_model(str(MODEL_S2), num_iteration=booster.best_iteration)
     imp = sorted(zip(booster.feature_name(), booster.feature_importance("gain")), key=lambda x: -x[1])
-    (C.EXP_RUN / "s2_importance.json").write_text(json.dumps([(n, round(g, 1)) for n, g in imp], indent=1))
+    (C.EXP_RUN / f"s2_importance{SFX}.json").write_text(json.dumps([(n, round(g, 1)) for n, g in imp], indent=1))
 
 
 def evaluate(w: int = 20):
-    d = pl.read_parquet(S2 / f"s2feats_w{w}.parquet")
+    d = pl.read_parquet(S2 / f"s2feats_w{w}{SFX}.parquet")
     sp = _split()
     hold = sp.filter(pl.col("is_holdout") & ~pl.col("is_ghost")).select(pl.col("entity_id").alias("s1"), "country", "holdout_half")
     d = d.join(hold.select("s1"), on="s1")
@@ -281,8 +284,8 @@ def evaluate(w: int = 20):
             if best is None or f > best[0]:
                 best = (f, ta, tb)
     rep["final_params"] = {"t_any": best[1], "t_add": best[2], "holdout_f05": best[0]}
-    (C.EXP_RUN / f"s2_eval_w{w}.json").write_text(json.dumps(rep, indent=2))
-    s2.write_parquet(S2 / f"holdout_pred_w{w}.parquet")
+    (C.EXP_RUN / f"s2_eval_w{w}{SFX}.json").write_text(json.dumps(rep, indent=2))
+    s2.write_parquet(S2 / f"holdout_pred_w{w}{SFX}.parquet")
     step("stage2", "eval w%d: stage2 %s | stage1 same universe %s | final %s" % (
         w, {k: v["report"]["macro_f05"] for k, v in rep["stage2"].items()},
         {k: v["report"]["macro_f05"] for k, v in rep["stage1_same_universe"].items()}, rep["final_params"]))
@@ -291,10 +294,10 @@ def evaluate(w: int = 20):
 def test():
     st = pl.read_parquet(C.WORK / "pred" / "test.parquet").rename({"p": "p1"})
     cand = pl.read_parquet(C.WORK / "cand" / "test.parquet")
-    d = _with_ce(s2_features(st, cand, _a_null("test")), S2 / "ce_test.parquet")
+    d = _with_ce(s2_features(st, cand, _a_null("test")), S2 / f"ce_test{SFX}.parquet")
     booster = lgb.Booster(model_file=str(MODEL_S2))
     out = d.select("s1", "m").with_columns(pl.Series("p", booster.predict(d.select(booster.feature_name()).to_numpy())))
-    out.write_parquet(S2 / "test_pred.parquet")
+    out.write_parquet(S2 / f"test_pred{SFX}.parquet")
     step("stage2", f"test: stage-2 scores for {out.height:,} pairs")
 
 
