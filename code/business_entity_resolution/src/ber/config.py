@@ -24,6 +24,11 @@ MATCH_BUCKETS = (0, 1, 2, 3, 4, 5)  # 6+ is the last bucket
 # Run name: model file models/lgb_<RUN>.txt (v1 = first submission, v2 = blocking v2).
 RUN = os.environ.get("BER_RUN", "v2")
 
+# Mutable per-run artifacts (candidates, features, predictions, stage 2). Runs v1-v5 used cache/
+# directly; BER_WORK=v6 keeps a new run's artifacts in cache/v6/ so earlier packages stay reproducible.
+WORK = CACHE / os.environ["BER_WORK"] if os.environ.get("BER_WORK") else CACHE
+V6 = RUN == "v6"  # dense-retrieval blocking (ber.blocking_v6) and its blocking feature columns
+
 # Default CPU budget; override BER_PROCS for the local machine.
 N_PROCS = int(os.environ.get("BER_PROCS", "96"))
 

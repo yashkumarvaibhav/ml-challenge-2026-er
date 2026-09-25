@@ -30,7 +30,7 @@ MODEL = C.ROOT / "models" / f"lgb_{C.RUN}.txt"
 # the final scores / thresholds can be overridden (e.g. stage 2 + cross-encoder):
 #   BER_TEST_PRED=cache/s2/test_pred.parquet BER_DECISION=experiments/decision_params_s2ce.json
 DECISION = C.ROOT / os.environ["BER_DECISION"] if "BER_DECISION" in os.environ else C.EXPERIMENTS / "decision_params.json"
-TEST_PRED = C.ROOT / os.environ["BER_TEST_PRED"] if "BER_TEST_PRED" in os.environ else C.CACHE / "pred" / "test.parquet"
+TEST_PRED = C.ROOT / os.environ["BER_TEST_PRED"] if "BER_TEST_PRED" in os.environ else C.WORK / "pred" / "test.parquet"
 
 
 def _split():
@@ -43,16 +43,16 @@ def _world_ids(w: int) -> pl.DataFrame:
 
 
 def train_features():
-    (C.CACHE / "feats").mkdir(parents=True, exist_ok=True)
+    (C.WORK / "feats").mkdir(parents=True, exist_ok=True)
     for w in (20, 0):
-        cand = pl.read_parquet(C.CACHE / "cand" / f"train_w{w}.parquet")
+        cand = pl.read_parquet(C.WORK / "cand" / f"train_w{w}.parquet")
         f = build_features("train", cand, _world_ids(w), name=f"features train w{w}")
-        f.write_parquet(C.CACHE / "feats" / f"train_w{w}.parquet")
+        f.write_parquet(C.WORK / "feats" / f"train_w{w}.parquet")
 
 
 def train_fit():
     truth = load_train_pairs()
-    f = label(pl.read_parquet(C.CACHE / "feats" / "train_w20.parquet"), truth)
+    f = label(pl.read_parquet(C.WORK / "feats" / "train_w20.parquet"), truth)
     sp = _split()
     booster = train(f, sp.filter(pl.col("is_train")).select("entity_id"), name=f"fit lgb_{C.RUN}")
     MODEL.parent.mkdir(parents=True, exist_ok=True)
@@ -68,12 +68,12 @@ def train_eval():
         pl.col("entity_id").alias("s1"), "country", "holdout_half")
     booster = lgb.Booster(model_file=str(MODEL))
     report, scored_by_w = {}, {}
-    (C.CACHE / "pred").mkdir(parents=True, exist_ok=True)
+    (C.WORK / "pred").mkdir(parents=True, exist_ok=True)
     for w in (20, 0):
-        f = pl.read_parquet(C.CACHE / "feats" / f"train_w{w}.parquet").join(hold.select("s1"), on="s1")
+        f = pl.read_parquet(C.WORK / "feats" / f"train_w{w}.parquet").join(hold.select("s1"), on="s1")
         step("eval", f"world{w}: predicting {f.height:,} holdout pairs, then threshold tuning (A/B) ...")
         scored = f.select("s1", "m").with_columns(pl.Series("p", predict(booster, f)))
-        scored.write_parquet(C.CACHE / "pred" / f"train_holdout_w{w}.parquet")
+        scored.write_parquet(C.WORK / "pred" / f"train_holdout_w{w}.parquet")
         scored_by_w[w] = scored
         report[f"world{w}"] = two_way(scored, truth, hold)
         step("eval", f"world{w}: " + json.dumps({k: v["report"]["macro_f05"] for k, v in report[f"world{w}"].items()}))
@@ -100,7 +100,7 @@ def test_score(parts: int = 4):
     """Features + prediction in S1-partitioned parts (bounded memory; per-S1 context
     features stay exact because every S1's candidates are in the same part)."""
     booster = lgb.Booster(model_file=str(MODEL))
-    cand = pl.read_parquet(C.CACHE / "cand" / "test.parquet")
+    cand = pl.read_parquet(C.WORK / "cand" / "test.parquet")
     world = load_source("test", 1).select("entity_id")
     cand = cand.with_columns((pl.col("s1").hash(seed=0) % parts).alias("_part"))
     out = []
@@ -112,14 +112,14 @@ def test_score(parts: int = 4):
         out.append(f.select("s1", "m").with_columns(pl.Series("p", predict(booster, f))))
         del f
     scored = pl.concat(out)
-    scored.write_parquet(C.CACHE / "pred" / "test.parquet")
+    scored.write_parquet(C.WORK / "pred" / "test.parquet")
     step("score", f"test: scored {scored.height:,} pairs")
 
 
 def test_write():
     params = json.loads(DECISION.read_text())
     scored = pl.read_parquet(TEST_PRED)
-    cand = pl.read_parquet(C.CACHE / "cand" / "test.parquet").select("s1", "m")
+    cand = pl.read_parquet(C.WORK / "cand" / "test.parquet").select("s1", "m")
     s1 = load_source("test", 1).select(pl.col("entity_id").alias("s1"))
     pred = decide(scored, params["t_any"], params["t_add"])
     C.OUTPUT.mkdir(parents=True, exist_ok=True)

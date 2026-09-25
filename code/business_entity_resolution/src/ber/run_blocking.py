@@ -15,7 +15,8 @@ import time
 import polars as pl
 
 from . import config as C
-from .blocking import block
+from .blocking import block as block_v4
+from .blocking_v6 import block as block_v6
 from .io import load_train_pairs
 from .metrics import blocking_report
 from .progress import step
@@ -36,7 +37,7 @@ def run_train(worlds):
     trn = sp.filter(pl.col("is_train")).sample(TRAIN_SAMPLE, seed=C.SEED)
     truth = load_train_pairs().select("s1", "m")
     flags = mflags("train")
-    (C.CACHE / "cand").mkdir(parents=True, exist_ok=True)
+    (C.WORK / "cand").mkdir(parents=True, exist_ok=True)
     for w in worlds:
         t0 = time.time()
         if w == 20:
@@ -46,8 +47,8 @@ def run_train(worlds):
             world = sp.select("entity_id")
             queries = hold.select("entity_id")
         step("run_blocking", f"train world{w}: {queries.height:,} queries, world {world.height:,} S1")
-        cand = block("train", queries, world)
-        cand.write_parquet(C.CACHE / "cand" / f"train_w{w}.parquet")
+        cand = (block_v6 if C.V6 else block_v4)("train", queries, world)
+        cand.write_parquet(C.WORK / "cand" / f"train_w{w}.parquet")
         s1 = hold.select(pl.col("entity_id").alias("s1"), "country")
         rep = blocking_report(cand, truth, s1, flags)
         rep["runtime_sec"] = round(time.time() - t0)
@@ -60,21 +61,21 @@ def run_train(worlds):
 def run_train_full(worlds):
     """Stage-2 universe: candidates for ALL S1s of each world (every rival S1 present, as on test)."""
     sp = pl.read_parquet(C.CACHE / "splits" / "train_s1_split.parquet")
-    (C.CACHE / "cand").mkdir(parents=True, exist_ok=True)
+    (C.WORK / "cand").mkdir(parents=True, exist_ok=True)
     for w in worlds:
         world = (sp.filter(~pl.col("is_ghost")) if w == 20 else sp).select("entity_id")
         step("run_blocking", f"train FULL world{w}: {world.height:,} queries = whole world")
-        cand = block("train", world, world)
-        cand.write_parquet(C.CACHE / "cand" / f"train_full_w{w}.parquet")
+        cand = (block_v6 if C.V6 else block_v4)("train", world, world)
+        cand.write_parquet(C.WORK / "cand" / f"train_full_w{w}.parquet")
         step("run_blocking", f"train FULL world{w}: {cand.height:,} pairs written")
 
 
 def run_test():
     from .io import load_source
     s1 = load_source("test", 1).select("entity_id")
-    cand = block("test", s1, s1)
-    (C.CACHE / "cand").mkdir(parents=True, exist_ok=True)
-    cand.write_parquet(C.CACHE / "cand" / "test.parquet")
+    cand = (block_v6 if C.V6 else block_v4)("test", s1, s1)
+    (C.WORK / "cand").mkdir(parents=True, exist_ok=True)
+    cand.write_parquet(C.WORK / "cand" / "test.parquet")
     step("run_blocking", f"test: {cand.height:,} pairs, {cand['s1'].n_unique():,} S1 with >=1 candidate of {s1.height:,}")
 
 

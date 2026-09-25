@@ -35,11 +35,14 @@ FEATURES = [
     "a_nnum2", "a_comp_cov1", "a_comp_cov2", "a_ntok1", "a_ntok2", "a_ncomma1", "a_ncomma2", "a_numfrac2",
     # record flags (S2/S3 side) + source
     "m_native", "m_native_mapped", "m_allcaps", "m_accent", "m_domain", "m_dba", "m_is_s3",
-    # blocking
-    "s_a", "s_b", "s_c", "r_a", "r_b", "r_c", "r_e", "in_d", "r_f", "r_g", "r_h", "r_j", "prio",
-    # context (label-free)
-    "amb_s1_core", "amb_pool_core", "c_n_cand", "c_sc_rel", "c_sc_rank",
 ]
+# blocking columns (v6: bi-encoder cosine + channel ranks) and label-free context; c_sc_* are relative to the
+# per-S1 best blocking score (v4: combined IDF overlap s_c; v6: bi-encoder cosine d_cos)
+BLK_COLS = (["d_cos", "r_df", "r_dr", "r_h", "r_j", "in_fan", "pri"] if C.V6 else
+            ["s_a", "s_b", "s_c", "r_a", "r_b", "r_c", "r_e", "in_d", "r_f", "r_g", "r_h", "r_j", "prio"])
+SCORE_COL, FLAG_COL = ("d_cos", "in_fan") if C.V6 else ("s_c", "in_d")
+CTX_COLS = ["amb_s1_core", "amb_pool_core", "c_n_cand", "c_sc_rel", "c_sc_rank"]
+FEATURES = FEATURES + BLK_COLS + CTX_COLS
 
 
 def _idf_sum(toks, idf, default):
@@ -116,8 +119,6 @@ def _pair_feats(r1, r2, blk, ctx, nidf, aidf, ndef, adef):
 
 REC_COLS = ["country", "n_tok", "a_tok", "a_comp", "a_nums", "n_native", "n_native_mapped_frac", "n_allcaps",
             "n_accent", "n_domain", "n_dba", "a_null", "a_ncomma"]
-BLK_COLS = ["s_a", "s_b", "s_c", "r_a", "r_b", "r_c", "r_e", "in_d", "r_f", "r_g", "r_h", "r_j", "prio"]
-CTX_COLS = ["amb_s1_core", "amb_pool_core", "c_n_cand", "c_sc_rel", "c_sc_rank"]
 
 
 def _work(job):
@@ -127,7 +128,7 @@ def _work(job):
     off, path = job
     P = pl.read_parquet(path).to_dict(as_series=False)
     os.remove(path)
-    n = len(P["s_a"])
+    n = len(P["1_country"])
     out = np.empty((n, len(FEATURES)), np.float32)
     for i in range(n):
         r1 = {k: P["1_" + k][i] for k in REC_COLS}
@@ -179,9 +180,9 @@ def build(split: str, cand: pl.DataFrame, world_ids: pl.DataFrame, name: str) ->
 
     c = cand.with_columns(
         pl.len().over("s1").alias("c_n_cand"),
-        (pl.col("s_c").fill_null(0) / pl.col("s_c").fill_null(0).max().over("s1").clip(lower_bound=1e-6)).alias("c_sc_rel"),
-        pl.col("s_c").fill_null(0).rank("ordinal", descending=True).over("s1").alias("c_sc_rank"),
-        pl.col("in_d").cast(pl.Float32),
+        (pl.col(SCORE_COL).fill_null(0) / pl.col(SCORE_COL).fill_null(0).max().over("s1").clip(lower_bound=1e-6)).alias("c_sc_rel"),
+        pl.col(SCORE_COL).fill_null(0).rank("ordinal", descending=True).over("s1").alias("c_sc_rank"),
+        pl.col(FLAG_COL).cast(pl.Float32),
     )
     q = s1.join(c.select(pl.col("s1").alias("entity_id")).unique(), on="entity_id").with_columns(key.alias("k")) \
         .join(s1k, on=["country", "k"], how="left").drop("k")

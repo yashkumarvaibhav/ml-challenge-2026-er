@@ -38,19 +38,20 @@ from .metrics import per_s1_f05, summarize
 from .model import GRID_ADD, GRID_ANY, PARAMS, decide, two_way
 from .progress import Progress, step
 
-S2 = C.CACHE / "s2"
+S2 = C.WORK / "s2"
 PARTS = 6
 N_FOLDS = 3
 FOLD_TRAIN_S1 = 400_000
 S2_TRAIN_S1 = 400_000
-BLK = ["s_a", "s_b", "s_c", "r_a", "r_b", "r_c", "r_e", "r_f", "r_g", "r_h", "r_j", "prio"]
+BLK = (["d_cos", "r_df", "r_dr", "r_h", "r_j", "pri"] if C.V6 else
+       ["s_a", "s_b", "s_c", "r_a", "r_b", "r_c", "r_e", "r_f", "r_g", "r_h", "r_j", "prio"])
 S2_FEATURES = ["p1", "lp1", "m_best_other", "m_gap", "m_rank", "m_n_hi", "m_n_cand",
                "s_rank", "s_top", "s_gap_top", "s_n_hi", "s_sum", "s_n_cand", "m_a_null"] + BLK
 # multilingual cross-encoder score, only for the stage-1 uncertain band (missing elsewhere, as on test)
 CE_BAND = (0.01, 0.995)
 CE_FEATURES = ["ce", "ce_minus_p1"]
-MODEL_V4 = C.ROOT / "models" / "lgb_v4.txt"
-MODEL_S2 = C.ROOT / "models" / "lgb_s2.txt"
+MODEL_V4 = C.ROOT / "models" / ("lgb_v6.txt" if C.V6 else "lgb_v4.txt")  # the stage-1 model of this run
+MODEL_S2 = C.ROOT / "models" / ("lgb_s2_v6.txt" if C.V6 else "lgb_s2.txt")
 
 
 def _split():
@@ -63,7 +64,7 @@ def _part_expr(k):
 
 def feats(w: int):
     """Stage-1 features for the full universe, written in S1-partitioned parquet parts."""
-    cand = pl.read_parquet(C.CACHE / "cand" / f"train_full_w{w}.parquet")
+    cand = pl.read_parquet(C.WORK / "cand" / f"train_full_w{w}.parquet")
     sp = _split()
     world = (sp.filter(~pl.col("is_ghost")) if w == 20 else sp).select("entity_id")
     out = S2 / f"feats_w{w}"
@@ -131,7 +132,7 @@ def _v4_scores(w: int, s1: pl.DataFrame) -> pl.DataFrame:
 
 def _assert_coverage(st: pl.DataFrame, w: int):
     """Every candidate pair of the world universe has exactly one stage-1 score (else rival features are wrong)."""
-    cand = pl.read_parquet(C.CACHE / "cand" / f"train_full_w{w}.parquet", columns=["s1", "m"])
+    cand = pl.read_parquet(C.WORK / "cand" / f"train_full_w{w}.parquet", columns=["s1", "m"])
     dup = st.height - st.select("s1", "m").unique().height
     missing = cand.join(st, on=["s1", "m"], how="anti").height
     extra = st.join(cand, on=["s1", "m"], how="anti").height
@@ -165,7 +166,7 @@ def ce_train_universe(w: int):
 
 def ce_test():
     from .cross_encoder import score
-    st = pl.read_parquet(C.CACHE / "pred" / "test.parquet").filter(pl.col("p").is_between(*CE_BAND)).select("s1", "m")
+    st = pl.read_parquet(C.WORK / "pred" / "test.parquet").filter(pl.col("p").is_between(*CE_BAND)).select("s1", "m")
     step("stage2", f"CE scoring {st.height:,} test band pairs ...")
     st.with_columns(pl.Series("ce", score(st, "test", name="ce score test band"))).write_parquet(S2 / "ce_test.parquet")
 
@@ -214,7 +215,7 @@ def _a_null(split):
 def s2feats(w: int):
     st = pl.read_parquet(S2 / f"stage1_w{w}.parquet")
     _assert_coverage(st, w)
-    cand = pl.read_parquet(C.CACHE / "cand" / f"train_full_w{w}.parquet")
+    cand = pl.read_parquet(C.WORK / "cand" / f"train_full_w{w}.parquet")
     step("stage2", f"competition features over {st.height:,} pairs ...")
     _with_ce(s2_features(st, cand, _a_null("train")), S2 / f"ce_w{w}.parquet").write_parquet(S2 / f"s2feats_w{w}.parquet")
 
@@ -268,8 +269,8 @@ def evaluate(w: int = 20):
 
 
 def test():
-    st = pl.read_parquet(C.CACHE / "pred" / "test.parquet").rename({"p": "p1"})
-    cand = pl.read_parquet(C.CACHE / "cand" / "test.parquet")
+    st = pl.read_parquet(C.WORK / "pred" / "test.parquet").rename({"p": "p1"})
+    cand = pl.read_parquet(C.WORK / "cand" / "test.parquet")
     d = _with_ce(s2_features(st, cand, _a_null("test")), S2 / "ce_test.parquet")
     booster = lgb.Booster(model_file=str(MODEL_S2))
     out = d.select("s1", "m").with_columns(pl.Series("p", booster.predict(d.select(booster.feature_name()).to_numpy())))
