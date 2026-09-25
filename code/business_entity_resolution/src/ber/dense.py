@@ -3,8 +3,8 @@
 A bi-encoder (intfloat/multilingual-e5-small, MIT, 117.7M parameters, pinned revision 614241f6) is
 fine-tuned on supplied training pairs with a symmetric InfoNCE loss (in-batch negatives + one hard
 negative per anchor from the rule-based candidates). Every record is embedded once from its raw
-"name | address" text; candidates are then retrieved per country with a faiss IVF inner-product
-index (approximate nearest neighbours: sub-linear per query, so blocking scales):
+"name | address" text; candidates are then retrieved per country with an IVF inner-product index (`ber.ann`, GPU;
+approximate nearest neighbours: each query scans nprobe of nlist clusters, so blocking scales):
 
   forward  S1 -> top-k S2/S3 records
   reverse  S2/S3 record -> top-k S1s   (finds address-less and heavily noised records)
@@ -212,25 +212,15 @@ def encode():
 
 
 def _ivf(x: np.ndarray):
-    import faiss
-    faiss.omp_set_num_threads(C.N_PROCS)
-    d = x.shape[1]
-    nlist = int(NLIST_PER_SQRT * math.sqrt(len(x)))
-    index = faiss.IndexIVFFlat(faiss.IndexFlatIP(d), d, nlist, faiss.METRIC_INNER_PRODUCT)
-    rng = np.random.default_rng(C.SEED)
-    index.train(x[rng.choice(len(x), min(len(x), 100 * nlist), replace=False)])
-    index.add(x)
-    index.nprobe = NPROBE
-    return index
+    """GPU IVF index (ber.ann; the CPU faiss wheel runs single-threaded on this server)."""
+    from .ann import IVF
+    return IVF(x, seed=C.SEED)
 
 
 def _search(index, q: np.ndarray, k: int, name: str):
     prog = Progress(name, len(q), unit="queries")
-    D = np.empty((len(q), k), np.float32)
-    I = np.empty((len(q), k), np.int64)
-    for b in range(0, len(q), 200_000):
-        D[b:b + 200_000], I[b:b + 200_000] = index.search(q[b:b + 200_000], k)
-        prog.update(len(q[b:b + 200_000]))
+    D, I = index.search(q, k)
+    prog.update(len(q))
     prog.done()
     return D, I
 
@@ -250,28 +240,35 @@ def retrieve(split: str, query_ids: pl.DataFrame, world_ids: pl.DataFrame, k_fwd
         if qq.height == 0:
             continue
         t0 = time.time()
-        XP = np.ascontiguousarray(EP[pc["j"].to_numpy()], dtype=np.float32)
-        XW = np.ascontiguousarray(E1[w["i"].to_numpy()], dtype=np.float32)
-        XQ = np.ascontiguousarray(E1[qq["i"].to_numpy()], dtype=np.float32)
-        D, I = _search(_ivf(XP), XQ, k_fwd, f"dense {split} {cty} forward")
+        XP = np.ascontiguousarray(EP[pc["j"].to_numpy()], dtype=np.float16)
+        XW = np.ascontiguousarray(E1[w["i"].to_numpy()], dtype=np.float16)
+        XQ = np.ascontiguousarray(E1[qq["i"].to_numpy()], dtype=np.float16)
+        fi = _ivf(XP)
+        D, I = _search(fi, XQ, k_fwd, f"dense {split} {cty} forward")
+        scan_f = fi.scan_fraction()
+        del fi
         fwd = pl.DataFrame({"s1": np.repeat(qq["entity_id"].to_numpy(), k_fwd), "pj": I.ravel(), "d_f": D.ravel(),
                             "r_df": np.tile(np.arange(1, k_fwd + 1, dtype=np.int16), len(qq))}).filter(pl.col("pj") >= 0)
         fwd = fwd.join(pc.select(pl.col("entity_id").alias("m")).with_row_index("pj").with_columns(pl.col("pj").cast(pl.Int64)), on="pj").drop("pj")
-        D, I = _search(_ivf(XW), XP, k_rev, f"dense {split} {cty} reverse")
+        ri = _ivf(XW)
+        D, I = _search(ri, XP, k_rev, f"dense {split} {cty} reverse")
+        scan_r = ri.scan_fraction()
+        del ri
         rev = pl.DataFrame({"m": np.repeat(pc["entity_id"].to_numpy(), k_rev), "wi": I.ravel(), "d_r": D.ravel(),
                             "r_dr": np.tile(np.arange(1, k_rev + 1, dtype=np.int16), len(pc))}).filter(pl.col("wi") >= 0)
         rev = rev.join(w.select(pl.col("entity_id").alias("s1")).with_row_index("wi").with_columns(pl.col("wi").cast(pl.Int64)), on="wi").drop("wi") \
             .join(qq.select(pl.col("entity_id").alias("s1")), on="s1")
         c = fwd.join(rev, on=["s1", "m"], how="full", coalesce=True).with_columns(pl.coalesce("d_f", "d_r").alias("d_cos")).drop("d_f", "d_r")
         outs.append(c)
-        step("dense", f"{split} {cty}: {c.height:,} pairs ({c.height / qq.height:.1f}/S1) in {time.time() - t0:.0f}s")
+        step("dense", f"{split} {cty}: {c.height:,} pairs ({c.height / qq.height:.1f}/S1) in {time.time() - t0:.0f}s; "
+                      f"IVF scan per query: forward {scan_f:.2%} of {len(XP):,} records, reverse {scan_r:.2%} of {len(XW):,} S1s")
     return pl.concat(outs)
 
 
 def ann_check(n_q: int = 4000, k: int = 50):
     """IVF vs exact cosine top-k from the SAME embeddings on a fixed holdout query sample (per country),
     for several nprobe values: separates embedding quality from approximate-index loss."""
-    import faiss
+    from .ann import IVF, exact_search
     sp = pl.read_parquet(C.CACHE / "splits" / "train_s1_split.parquet")
     hold = sp.filter(pl.col("is_holdout") & ~pl.col("is_ghost"))
     s1ids = pl.read_parquet(DATA / "ids_train_s1.parquet").with_row_index("i")
@@ -280,19 +277,21 @@ def ann_check(n_q: int = 4000, k: int = 50):
     rep = {}
     for cty in ("US", "India"):
         q = s1ids.join(hold.select("entity_id"), on="entity_id").filter(pl.col("country") == cty).sample(n_q, seed=C.SEED)
-        XQ = np.ascontiguousarray(E1[q["i"].to_numpy()], dtype=np.float32)
-        XP = np.ascontiguousarray(EP[pids.filter(pl.col("country") == cty)["j"].to_numpy()], dtype=np.float32)
-        flat = faiss.IndexFlatIP(XP.shape[1])  # exact inner-product search (brute force, multi-threaded, low memory)
-        flat.add(XP)
-        _, exact = flat.search(XQ, k)
-        del flat
-        index = _ivf(XP)
+        XQ = np.ascontiguousarray(E1[q["i"].to_numpy()])
+        XP = np.ascontiguousarray(EP[pids.filter(pl.col("country") == cty)["j"].to_numpy()])
+        _, exact = exact_search(XP, XQ, k)
+        t0 = time.time()
+        index = IVF(XP, seed=C.SEED)
+        rep[f"{cty} build_s"] = round(time.time() - t0, 1)
+        rep[f"{cty} nlist"] = index.nlist
         for nprobe in (16, 32, 64, 128):
-            index.nprobe = nprobe
-            _, I = index.search(XQ, k)
+            t0 = time.time()
+            _, I = index.search(XQ, k, nprobe=nprobe)
+            rep[f"{cty} nprobe{nprobe} search_s_per_1k"] = round((time.time() - t0) / n_q * 1000, 3)
             for kk in (10, 20, 50):
                 ov = np.mean([len(set(exact[r, :kk]) & set(I[r, :kk])) / kk for r in range(len(XQ))])
                 rep[f"{cty} nprobe{nprobe} overlap@{kk}"] = round(float(ov), 4)
+        del index
     (C.EXPERIMENTS / "dense_ann_check.json").write_text(json.dumps(rep, indent=1))
     step("dense", "ann_check: " + json.dumps(rep))
 
