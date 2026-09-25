@@ -57,6 +57,18 @@ def run_train(worlds):
         print(json.dumps(rep, indent=2), flush=True)
 
 
+def run_train_full(worlds):
+    """Stage-2 universe: candidates for ALL S1s of each world (every rival S1 present, as on test)."""
+    sp = pl.read_parquet(C.CACHE / "splits" / "train_s1_split.parquet")
+    (C.CACHE / "cand").mkdir(parents=True, exist_ok=True)
+    for w in worlds:
+        world = (sp.filter(~pl.col("is_ghost")) if w == 20 else sp).select("entity_id")
+        step("run_blocking", f"train FULL world{w}: {world.height:,} queries = whole world")
+        cand = block("train", world, world)
+        cand.write_parquet(C.CACHE / "cand" / f"train_full_w{w}.parquet")
+        step("run_blocking", f"train FULL world{w}: {cand.height:,} pairs written")
+
+
 def run_test():
     from .io import load_source
     s1 = load_source("test", 1).select("entity_id")
@@ -70,8 +82,11 @@ if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("--split", choices=["train", "test"], required=True)
     ap.add_argument("--worlds", default="20,0")
+    ap.add_argument("--full", action="store_true", help="queries = all S1s of the world (stage-2 universe)")
     a = ap.parse_args()
-    if a.split == "train":
+    if a.split == "train" and a.full:
+        run_train_full([int(x) for x in a.worlds.split(",")])
+    elif a.split == "train":
         run_train([int(x) for x in a.worlds.split(",")])
     else:
         run_test()
