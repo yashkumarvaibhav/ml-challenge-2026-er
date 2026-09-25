@@ -44,6 +44,9 @@ S2_TRAIN_S1 = 400_000
 BLK = ["s_a", "s_b", "s_c", "r_a", "r_b", "r_c", "r_e", "r_f", "r_g", "r_h", "r_j", "prio"]
 S2_FEATURES = ["p1", "lp1", "m_best_other", "m_gap", "m_rank", "m_n_hi", "m_n_cand",
                "s_rank", "s_top", "s_gap_top", "s_n_hi", "s_sum", "s_n_cand", "m_a_null"] + BLK
+# multilingual cross-encoder score, only for the stage-1 uncertain band (missing elsewhere, as on test)
+CE_BAND = (0.01, 0.995)
+CE_FEATURES = ["ce", "ce_minus_p1"]
 MODEL_V4 = C.ROOT / "models" / "lgb_v4.txt"
 MODEL_S2 = C.ROOT / "models" / "lgb_s2.txt"
 
@@ -117,6 +120,33 @@ def oof(w: int):
     step("stage2", f"stage-1 scores written: {out.height:,} pairs")
 
 
+def ce_train_universe(w: int):
+    """CE scores on the uncertain band for the stage-2 fit sample + holdout (never CE-training S1s)."""
+    from .cross_encoder import score
+    st = pl.read_parquet(S2 / f"stage1_w{w}.parquet").filter(pl.col("p1").is_between(*CE_BAND))
+    sp = _split()
+    fit_s1 = sp.filter(pl.col("is_train")).select(pl.col("entity_id").alias("s1")).sample(S2_TRAIN_S1, seed=C.SEED + 99)
+    hold = sp.filter(pl.col("is_holdout")).select(pl.col("entity_id").alias("s1"))
+    rows = st.join(pl.concat([fit_s1, hold]).unique(), on="s1").select("s1", "m")
+    step("stage2", f"CE scoring {rows.height:,} band pairs (fit sample + holdout) ...")
+    rows.with_columns(pl.Series("ce", score(rows, "train", name=f"ce score train band w{w}"))).write_parquet(S2 / f"ce_w{w}.parquet")
+
+
+def ce_test():
+    from .cross_encoder import score
+    st = pl.read_parquet(C.CACHE / "pred" / "test.parquet").filter(pl.col("p").is_between(*CE_BAND)).select("s1", "m")
+    step("stage2", f"CE scoring {st.height:,} test band pairs ...")
+    st.with_columns(pl.Series("ce", score(st, "test", name="ce score test band"))).write_parquet(S2 / "ce_test.parquet")
+
+
+def _with_ce(d: pl.DataFrame, ce_path) -> pl.DataFrame:
+    if ce_path is None or not ce_path.exists():
+        return d.with_columns(pl.lit(None, pl.Float32).alias("ce"), pl.lit(None, pl.Float32).alias("ce_minus_p1"))
+    ce = pl.read_parquet(ce_path)
+    return d.join(ce, on=["s1", "m"], how="left").with_columns(
+        pl.col("ce").cast(pl.Float32), (pl.col("ce") - pl.col("p1")).cast(pl.Float32).alias("ce_minus_p1"))
+
+
 def s2_features(stage1: pl.DataFrame, cand: pl.DataFrame, a_null: pl.DataFrame) -> pl.DataFrame:
     """Competition features from stage-1 scores (label-free). stage1: s1, m, p1."""
     d = stage1.join(cand.select(["s1", "m"] + BLK), on=["s1", "m"], how="left").join(a_null, on="m", how="left")
@@ -154,19 +184,25 @@ def s2feats(w: int):
     st = pl.read_parquet(S2 / f"stage1_w{w}.parquet")
     cand = pl.read_parquet(C.CACHE / "cand" / f"train_full_w{w}.parquet")
     step("stage2", f"competition features over {st.height:,} pairs ...")
-    s2_features(st, cand, _a_null("train")).write_parquet(S2 / f"s2feats_w{w}.parquet")
+    _with_ce(s2_features(st, cand, _a_null("train")), S2 / f"ce_w{w}.parquet").write_parquet(S2 / f"s2feats_w{w}.parquet")
+
+
+def _feat_list(d: pl.DataFrame):
+    return S2_FEATURES + [c for c in CE_FEATURES if c in d.columns and d[c].null_count() < d.height]
 
 
 def fit(w: int = 20):
     d = pl.read_parquet(S2 / f"s2feats_w{w}.parquet")
+    FEATS = _feat_list(d)
+    step("stage2", f"fit features: {len(FEATS)} ({'with' if 'ce' in FEATS else 'without'} cross-encoder)")
     truth = load_train_pairs().select("s1", "m").with_columns(pl.lit(1, pl.Int8).alias("y"))
     tr_s1 = _split().filter(pl.col("is_train")).select(pl.col("entity_id").alias("s1")).sample(S2_TRAIN_S1, seed=C.SEED + 99)
     d = d.join(tr_s1, on="s1").join(truth, on=["s1", "m"], how="left").with_columns(pl.col("y").fill_null(0))
     es_s1 = d.select("s1").unique().sort("s1").sample(fraction=0.1, seed=C.SEED)
     es, trn = d.join(es_s1, on="s1"), d.join(es_s1, on="s1", how="anti")
     step("stage2", f"fit: {trn.height:,} rows (pos {int(trn['y'].sum()):,}), early-stop {es.height:,}")
-    dtr = lgb.Dataset(trn.select(S2_FEATURES).to_numpy(), trn["y"].to_numpy(), feature_name=S2_FEATURES, free_raw_data=True)
-    des = lgb.Dataset(es.select(S2_FEATURES).to_numpy(), es["y"].to_numpy(), reference=dtr)
+    dtr = lgb.Dataset(trn.select(FEATS).to_numpy(), trn["y"].to_numpy(), feature_name=FEATS, free_raw_data=True)
+    des = lgb.Dataset(es.select(FEATS).to_numpy(), es["y"].to_numpy(), reference=dtr)
     booster = lgb.train(PARAMS | {"metric": "binary_logloss", "num_leaves": 63}, dtr, 3000, valid_sets=[des], valid_names=["es"],
                         callbacks=[lgb.early_stopping(100, verbose=False)])
     step("stage2", f"fit: best iteration {booster.best_iteration}")
@@ -182,7 +218,7 @@ def evaluate(w: int = 20):
     d = d.join(hold.select("s1"), on="s1")
     truth = load_train_pairs().select("s1", "m")
     booster = lgb.Booster(model_file=str(MODEL_S2))
-    s2 = d.select("s1", "m").with_columns(pl.Series("p", booster.predict(d.select(S2_FEATURES).to_numpy())))
+    s2 = d.select("s1", "m").with_columns(pl.Series("p", booster.predict(d.select(booster.feature_name()).to_numpy())))
     s1only = d.select("s1", "m", pl.col("p1").alias("p"))
     rep = {"stage2": two_way(s2, truth, hold), "stage1_same_universe": two_way(s1only, truth, hold)}
     best = None
@@ -202,9 +238,9 @@ def evaluate(w: int = 20):
 def test():
     st = pl.read_parquet(C.CACHE / "pred" / "test.parquet").rename({"p": "p1"})
     cand = pl.read_parquet(C.CACHE / "cand" / "test.parquet")
-    d = s2_features(st, cand, _a_null("test"))
+    d = _with_ce(s2_features(st, cand, _a_null("test")), S2 / "ce_test.parquet")
     booster = lgb.Booster(model_file=str(MODEL_S2))
-    out = d.select("s1", "m").with_columns(pl.Series("p", booster.predict(d.select(S2_FEATURES).to_numpy())))
+    out = d.select("s1", "m").with_columns(pl.Series("p", booster.predict(d.select(booster.feature_name()).to_numpy())))
     out.write_parquet(S2 / "test_pred.parquet")
     step("stage2", f"test: stage-2 scores for {out.height:,} pairs")
 
@@ -216,7 +252,8 @@ if __name__ == "__main__":
     a = ap.parse_args()
     S2.mkdir(parents=True, exist_ok=True)
     t0 = time.time()
-    fns = {"feats": feats, "oof": oof, "s2feats": s2feats, "fit": fit, "eval": evaluate, "test": lambda w: test()}
+    fns = {"feats": feats, "oof": oof, "ce": ce_train_universe, "s2feats": s2feats, "fit": fit, "eval": evaluate,
+           "cetest": lambda w: ce_test(), "test": lambda w: test()}
     for s in a.steps.split(","):
         step("stage2", f"step {s} (world{a.world}) ...")
         fns[s](a.world)
