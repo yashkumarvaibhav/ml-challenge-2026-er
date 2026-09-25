@@ -66,12 +66,14 @@ def train_eval():
     (C.CACHE / "pred").mkdir(parents=True, exist_ok=True)
     for w in (20, 0):
         f = pl.read_parquet(C.CACHE / "feats" / f"train_w{w}.parquet").join(hold.select("s1"), on="s1")
+        step("eval", f"world{w}: predicting {f.height:,} holdout pairs, then threshold tuning (A/B) ...")
         scored = f.select("s1", "m").with_columns(pl.Series("p", predict(booster, f)))
         scored.write_parquet(C.CACHE / "pred" / f"train_holdout_w{w}.parquet")
         scored_by_w[w] = scored
         report[f"world{w}"] = two_way(scored, truth, hold)
         step("eval", f"world{w}: " + json.dumps({k: v["report"]["macro_f05"] for k, v in report[f"world{w}"].items()}))
     # final thresholds: best average over both worlds on the full holdout
+    step("eval", "final threshold grid over both worlds ...")
     best = None
     for ta in GRID_ANY:
         for tb in GRID_ADD:
@@ -99,7 +101,9 @@ def test_score(parts: int = 4):
     out = []
     for k in range(parts):
         ck = cand.filter(pl.col("_part") == k).drop("_part")
+        step("score", f"part {k + 1}/{parts}: preparing {ck.height:,} pairs (IDF tables, joins) ...")
         f = build_features("test", ck, world, name=f"features+score test part {k + 1}/{parts}")
+        step("score", f"part {k + 1}/{parts}: LightGBM predicting {f.height:,} pairs ...")
         out.append(f.select("s1", "m").with_columns(pl.Series("p", predict(booster, f))))
         del f
     scored = pl.concat(out)
