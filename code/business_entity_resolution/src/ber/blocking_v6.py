@@ -48,7 +48,7 @@ def _chargram(s1w: pl.DataFrame, q: pl.DataFrame, pool: pl.DataFrame, cty: str) 
     bounds = [(i, min(nullp.height, i + 2000)) for i in range(0, nullp.height, 2000)]
     prog = Progress(f"block_v6 {cty} char-gram null-record reverse", nullp.height, unit="rows")
     res = []
-    with mp.get_context("fork").Pool(C.N_PROCS) as p:
+    with mp.get_context("fork").Pool(min(C.N_PROCS, CG_PROCS)) as p:
         for n, out in p.imap_unordered(_cg_chunk, bounds, chunksize=1):
             res.append(out)
             prog.update(n)
@@ -62,6 +62,7 @@ def _chargram(s1w: pl.DataFrame, q: pl.DataFrame, pool: pl.DataFrame, cty: str) 
 
 # chosen on the two-world final-cap report (experiments/dense_recall_report.json, plan-discussion 2026-09-25 20:1x UTC)
 KF, KR, CAP, FAN, KCG = 20, 2, 30, 10, 3
+CG_PROCS = 32  # bounded fork pool for the char-gram channel (shared server memory)
 BIG = 10_000
 
 
@@ -116,7 +117,9 @@ def _cosine(pairs: pl.DataFrame, split: str) -> np.ndarray:
 def block(split: str, query_ids: pl.DataFrame, world_ids: pl.DataFrame, kf=KF, kr=KR, cap=CAP) -> pl.DataFrame:
     """query_ids / world_ids: one column `entity_id` (S1). Returns s1, m, d_cos, r_df, r_dr, r_h, r_j, in_fan, r_cg, pri."""
     t0 = time.time()
-    dc = retrieve(split, query_ids, world_ids, k_fwd=kf, k_rev=kr)
+    # key and char-gram channels FIRST, while this process is still small and has no CUDA context: the
+    # char-gram step forks workers, and forking a large parent caused swap pressure on the shared server
+    # (2026-09-25 ~20:45-21:12 UTC: memory PSI avg300 32%, load average ~700)
     s1 = load_norm(split, 1)
     pool = pl.concat([load_norm(split, 2), load_norm(split, 3)])
     keys = []
@@ -126,7 +129,10 @@ def block(split: str, query_ids: pl.DataFrame, world_ids: pl.DataFrame, kf=KF, k
         if q.height:
             pc = pool.filter(pl.col("country") == cty)
             keys.append(_keys(w, q, pc).join(_chargram(w, q, pc, cty), on=["s1", "m"], how="full", coalesce=True))
-    c = dc.join(pl.concat(keys, how="diagonal_relaxed"), on=["s1", "m"], how="full", coalesce=True).with_columns(pl.col("in_fan").fill_null(False))
+    keys = pl.concat(keys, how="diagonal_relaxed")
+    del s1, pool
+    dc = retrieve(split, query_ids, world_ids, k_fwd=kf, k_rev=kr)
+    c = dc.join(keys, on=["s1", "m"], how="full", coalesce=True).with_columns(pl.col("in_fan").fill_null(False))
     c = c.with_columns(pl.Series("d_cos", _cosine(c, split)))
     c = c.with_columns(pl.min_horizontal(
         [pl.col(k).cast(pl.Int32).fill_null(BIG) for k in ("r_df", "r_dr", "r_h", "r_j", "r_cg")]
