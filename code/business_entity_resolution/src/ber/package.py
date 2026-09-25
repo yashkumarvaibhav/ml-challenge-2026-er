@@ -12,6 +12,7 @@
 import argparse
 import hashlib
 import json
+import os
 import shutil
 import subprocess
 import sys
@@ -73,9 +74,11 @@ def main(tag: str):
         "sha256": {n: sha256(arch / n) for n in ("matching_results.tsv", "candidate_pairs.tsv", "code.zip")},
         "validator": [l for l in out.splitlines() if l.strip()][-3:],
     }
-    decision = C.EXPERIMENTS / "decision_params.json"
+    # the decision file and score file actually used for matching_results.tsv (reviewer 08:39 UTC: version-specific)
+    decision = C.ROOT / os.environ["BER_DECISION"] if "BER_DECISION" in os.environ else C.EXP_RUN / "decision_params.json"
+    meta["run"] = {k: os.environ.get(k) for k in ("BER_RUN", "BER_WORK", "BER_CE", "BER_TEST_PRED", "BER_DECISION")}
     if decision.exists():
-        meta["holdout"] = json.loads(decision.read_text())
+        meta["decision"] = {"file": str(decision.relative_to(C.ROOT)), **json.loads(decision.read_text())}
     (arch / "meta.json").write_text(json.dumps(meta, indent=2))
     print(json.dumps(meta, indent=2))
     with zipfile.ZipFile(arch / "code.zip") as z:
