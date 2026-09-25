@@ -19,7 +19,7 @@ import time
 import numpy as np
 import polars as pl
 import torch
-from transformers import AutoModel, AutoTokenizer
+from transformers import AutoModel, AutoModelForSequenceClassification, AutoTokenizer
 
 from . import config as C
 from .io import load_source, load_train_pairs
@@ -28,7 +28,13 @@ from .progress import Progress, step
 os.environ.setdefault("TOKENIZERS_PARALLELISM", "true")
 CE_NAME = os.environ.get("BER_CE", "e5small")
 BASES = {"e5small": ("intfloat/multilingual-e5-small", "614241f622f53c4eeff9890bdc4f31cfecc418b3"),
-         "e5base": ("intfloat/multilingual-e5-base", "d128750597153bb5987e10b1c3493a34e5a4502a")}
+         "e5base": ("intfloat/multilingual-e5-base", "d128750597153bb5987e10b1c3493a34e5a4502a"),
+         "e5large": ("intfloat/multilingual-e5-large", "3d7cfbdacd47fdda877c5cd8a79fbcc4f2a574f3"),     # MIT, ~560M
+         "bgerr": ("BAAI/bge-reranker-v2-m3", "953dc6f6f85a1b2dbfca4c34a2796e7dde08d41e")}          # Apache-2.0, ~568M
+# a model pre-trained AS a cross-encoder keeps its own sequence-classification head (reviewer 18:10 UTC);
+# plain encoders get mean pooling + a new linear head
+SEQCLS = CE_NAME == "bgerr"
+N_PAIRS = int(os.environ.get("BER_CE_NPAIRS", "0"))  # 0 = all CE training pairs; >0 = bounded pilot fit
 BASE = C.ROOT / "models" / "hf" / BASES[CE_NAME][0].split("/")[1]
 OUT = C.ROOT / "models" / f"ce_{CE_NAME}"
 SUFFIX = "" if CE_NAME == "e5small" else f"_{CE_NAME}"  # cache/report names of non-default CEs
@@ -47,10 +53,16 @@ def device():
 class CrossEncoder(torch.nn.Module):
     def __init__(self, base=BASE):
         super().__init__()
-        self.enc = AutoModel.from_pretrained(base)
-        self.head = torch.nn.Linear(self.enc.config.hidden_size, 1)
+        if SEQCLS:
+            self.enc = AutoModelForSequenceClassification.from_pretrained(base)
+            self.head = None
+        else:
+            self.enc = AutoModel.from_pretrained(base)
+            self.head = torch.nn.Linear(self.enc.config.hidden_size, 1)
 
     def forward(self, input_ids, attention_mask):
+        if SEQCLS:
+            return self.enc(input_ids=input_ids, attention_mask=attention_mask).logits.squeeze(-1)
         h = self.enc(input_ids=input_ids, attention_mask=attention_mask).last_hidden_state
         m = attention_mask.unsqueeze(-1).to(h.dtype)
         return self.head((h * m).sum(1) / m.sum(1).clamp(min=1.0)).squeeze(-1)
@@ -109,6 +121,8 @@ def train():
     tok = AutoTokenizer.from_pretrained(BASE)
     model = CrossEncoder().to(dev)
     d = pl.read_parquet(DATA / "train_pairs.parquet").sample(fraction=1.0, shuffle=True, seed=C.SEED + 5)  # joins may reorder
+    if N_PAIRS:
+        d = d.head(N_PAIRS)
     t1, t2, y = d["t1"].to_list(), d["t2"].to_list(), torch.tensor(d["y"].to_numpy(), dtype=torch.float32)
     ids_np, mask_np = pretokenize(t1, t2, tok, "ce tokenize train")
     n = len(t1)
@@ -171,6 +185,43 @@ def score(pairs: pl.DataFrame, split: str, name: str = "ce score", batch: int = 
     return out
 
 
+def bench(n_train_batches: int = 30, n_score: int = 50_000):
+    """Throughput benchmark before committing a full fit: train step time and scoring pairs/s."""
+    dev = device()
+    tok = AutoTokenizer.from_pretrained(BASE)
+    model = CrossEncoder().to(dev)
+    d = pl.read_parquet(DATA / "train_pairs.parquet").head(BATCH * n_train_batches + n_score)
+    ids_np, mask_np = pretokenize(d["t1"].to_list(), d["t2"].to_list(), tok, f"ce bench {CE_NAME} tokenize")
+    y = torch.tensor(d["y"].to_numpy(), dtype=torch.float32)
+    opt = torch.optim.AdamW(model.parameters(), lr=LR)
+    lossf = torch.nn.BCEWithLogitsLoss()
+    model.train()
+    torch.cuda.synchronize(); t0 = time.time()
+    for b in range(n_train_batches):
+        sl = slice(b * BATCH, (b + 1) * BATCH)
+        L = int(mask_np[sl].sum(1).max())
+        ids = torch.from_numpy(ids_np[sl, :L].astype(np.int64)).to(dev)
+        am = torch.from_numpy(mask_np[sl, :L].astype(np.int64)).to(dev)
+        with torch.autocast("cuda", dtype=torch.bfloat16):
+            loss = lossf(model(ids, am).float(), y[sl].to(dev))
+        opt.zero_grad(set_to_none=True); loss.backward(); opt.step()
+    torch.cuda.synchronize(); tr = (time.time() - t0) / (n_train_batches * BATCH)
+    model.eval(); t0 = time.time()
+    with torch.no_grad():
+        for b in range(BATCH * n_train_batches, len(d), 1024):
+            L = int(mask_np[b:b + 1024].sum(1).max())
+            ids = torch.from_numpy(ids_np[b:b + 1024, :L].astype(np.int64)).to(dev)
+            am = torch.from_numpy(mask_np[b:b + 1024, :L].astype(np.int64)).to(dev)
+            with torch.autocast("cuda", dtype=torch.bfloat16):
+                model(ids, am)
+    torch.cuda.synchronize(); sc = (time.time() - t0) / max(1, len(d) - BATCH * n_train_batches)
+    rep = {"model": CE_NAME, "train_pairs_per_s": round(1 / tr), "score_pairs_per_s": round(1 / sc),
+           "full_fit_3.06M_h": round(3.06e6 * tr / 3600, 2), "fit_1M_h": round(1e6 * tr / 3600, 2),
+           "score_test_band_2M_min": round(2e6 * sc / 60, 1), "peak_gpu_gb": round(torch.cuda.max_memory_allocated(dev) / 1e9, 1)}
+    (C.EXPERIMENTS / f"ce_bench{SUFFIX}.json").write_text(json.dumps(rep, indent=1))
+    step("ce", "bench: " + json.dumps(rep))
+
+
 def evalband():
     """Holdout uncertain-band check: CE vs stage-1 (v4) on pairs with v4 p in BAND."""
     from sklearn.metrics import log_loss, roc_auc_score
@@ -195,5 +246,5 @@ if __name__ == "__main__":
     t0 = time.time()
     for s in a.steps.split(","):
         step("ce", f"step {s} ...")
-        {"data": data, "train": train, "evalband": evalband}[s]()
+        {"data": data, "train": train, "evalband": evalband, "bench": bench}[s]()
     step("ce", f"steps {a.steps} DONE in {time.time() - t0:.0f}s")
