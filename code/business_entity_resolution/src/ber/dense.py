@@ -282,16 +282,10 @@ def ann_check(n_q: int = 4000, k: int = 50):
         q = s1ids.join(hold.select("entity_id"), on="entity_id").filter(pl.col("country") == cty).sample(n_q, seed=C.SEED)
         XQ = np.ascontiguousarray(E1[q["i"].to_numpy()], dtype=np.float32)
         XP = np.ascontiguousarray(EP[pids.filter(pl.col("country") == cty)["j"].to_numpy()], dtype=np.float32)
-        best_v = np.full((len(XQ), k), -9.0, np.float32)
-        best_i = np.zeros((len(XQ), k), np.int64)
-        for b0 in range(0, len(XP), 500_000):
-            S = XQ @ XP[b0:b0 + 500_000].T
-            v = np.concatenate([best_v, S], 1)
-            i = np.concatenate([best_i, np.arange(b0, b0 + S.shape[1])[None, :].repeat(len(XQ), 0)], 1)
-            top = np.argpartition(-v, k, axis=1)[:, :k]
-            best_v, best_i = np.take_along_axis(v, top, 1), np.take_along_axis(i, top, 1)
-        o = np.argsort(-best_v, 1)
-        exact = np.take_along_axis(best_i, o, 1)
+        flat = faiss.IndexFlatIP(XP.shape[1])  # exact inner-product search (brute force, multi-threaded, low memory)
+        flat.add(XP)
+        _, exact = flat.search(XQ, k)
+        del flat
         index = _ivf(XP)
         for nprobe in (16, 32, 64, 128):
             index.nprobe = nprobe
