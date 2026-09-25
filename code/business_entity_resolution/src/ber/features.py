@@ -38,7 +38,7 @@ FEATURES = [
 ]
 # blocking columns (v6: bi-encoder cosine + channel ranks) and label-free context; c_sc_* are relative to the
 # per-S1 best blocking score (v4: combined IDF overlap s_c; v6: bi-encoder cosine d_cos)
-BLK_COLS = (["d_cos", "r_df", "r_dr", "r_h", "r_j", "in_fan", "pri"] if C.V6 else
+BLK_COLS = (["d_cos", "r_df", "r_dr", "r_h", "r_j", "in_fan", "r_cg", "pri"] if C.V6 else
             ["s_a", "s_b", "s_c", "r_a", "r_b", "r_c", "r_e", "in_d", "r_f", "r_g", "r_h", "r_j", "prio"])
 SCORE_COL, FLAG_COL = ("d_cos", "in_fan") if C.V6 else ("s_c", "in_d")
 CTX_COLS = ["amb_s1_core", "amb_pool_core", "c_n_cand", "c_sc_rel", "c_sc_rank"]

@@ -6,21 +6,62 @@ Per country:
   (h)  exact core name + address number key       (as in v4 blocking; keys shared by <= 50 records)
   (j)  exact full name + address number key       (as in v4 blocking)
   (n)  address-null record whose exact normalized name is shared by <= FAN world S1s -> all of them
+  (cg) address-null record -> top KCG world S1s by char-3-gram TF-IDF cosine of the normalized name
+       (noisy / typo'd names that no word-level key reaches)
 Final set: union, ordered by the best channel rank (then cosine), capped at CAP per S1. This union is
 exactly `candidate_pairs.tsv` = the input to the first scoring model. Every pair gets its bi-encoder
 cosine `d_cos` (computed directly for key-channel pairs that dense retrieval did not return).
 """
+import multiprocessing as mp
 import time
 
 import numpy as np
 import polars as pl
+from sklearn.feature_extraction.text import TfidfVectorizer
 
 from . import config as C
 from .blocking import CORE_STOP_SHARE, KH, KH_KEYCAP, KJ, KJ_KEYCAP, load_norm
 from .dense import DATA, EMB, retrieve
-from .progress import step
+from .progress import Progress, step
 
-KF, KR, CAP, FAN = 20, 5, 30, 10
+_G = {}
+
+
+def _cg_chunk(b):
+    from .blocking import _topk_rows
+    lo, hi = b
+    S = (_G["Q"][lo:hi] @ _G["WT"]).tocsr()
+    r, c, v, rk = _topk_rows(S, KCG)
+    return hi - lo, (r + lo, c, rk)
+
+
+def _chargram(s1w: pl.DataFrame, q: pl.DataFrame, pool: pl.DataFrame, cty: str) -> pl.DataFrame:
+    """(cg) channel for one country: address-null records -> top KCG world S1s (char-3-gram TF-IDF, max_df 2%)."""
+    name = pl.col("n_tok").list.join(" ")
+    w = s1w.select("entity_id", name.alias("k"))
+    nullp = pool.filter(pl.col("a_tok").list.len() == 0).select(pl.col("entity_id").alias("m"), name.alias("k")).filter(pl.col("k") != "")
+    if nullp.height == 0:
+        return pl.DataFrame(schema={"s1": pl.Utf8, "m": pl.Utf8, "r_cg": pl.Int16})
+    vec = TfidfVectorizer(analyzer="char_wb", ngram_range=(3, 3), max_df=0.02, dtype=np.float32, sublinear_tf=True)
+    _G["WT"] = vec.fit_transform(w["k"].to_list()).T.tocsr()
+    _G["Q"] = vec.transform(nullp["k"].to_list()).tocsr()
+    bounds = [(i, min(nullp.height, i + 2000)) for i in range(0, nullp.height, 2000)]
+    prog = Progress(f"block_v6 {cty} char-gram null-record reverse", nullp.height, unit="rows")
+    res = []
+    with mp.get_context("fork").Pool(C.N_PROCS) as p:
+        for n, out in p.imap_unordered(_cg_chunk, bounds, chunksize=1):
+            res.append(out)
+            prog.update(n)
+    prog.done()
+    _G.clear()
+    g = pl.concat([pl.DataFrame({"qi": r.astype(np.int64), "wi": c.astype(np.int64), "r_cg": rk.astype(np.int16)}) for r, c, rk in res])
+    g = (g.join(nullp.select("m").with_row_index("qi").with_columns(pl.col("qi").cast(pl.Int64)), on="qi")
+         .join(w.select(pl.col("entity_id").alias("s1")).with_row_index("wi").with_columns(pl.col("wi").cast(pl.Int64)), on="wi")
+         .select("s1", "m", "r_cg"))
+    return g.join(q.select(pl.col("entity_id").alias("s1")), on="s1")
+
+# chosen on the two-world final-cap report (experiments/dense_recall_report.json, plan-discussion 2026-09-25 20:1x UTC)
+KF, KR, CAP, FAN, KCG = 20, 2, 30, 10, 3
 BIG = 10_000
 
 
@@ -73,7 +114,7 @@ def _cosine(pairs: pl.DataFrame, split: str) -> np.ndarray:
 
 
 def block(split: str, query_ids: pl.DataFrame, world_ids: pl.DataFrame, kf=KF, kr=KR, cap=CAP) -> pl.DataFrame:
-    """query_ids / world_ids: one column `entity_id` (S1). Returns s1, m, d_cos, r_df, r_dr, r_h, r_j, in_fan, pri."""
+    """query_ids / world_ids: one column `entity_id` (S1). Returns s1, m, d_cos, r_df, r_dr, r_h, r_j, in_fan, r_cg, pri."""
     t0 = time.time()
     dc = retrieve(split, query_ids, world_ids, k_fwd=kf, k_rev=kr)
     s1 = load_norm(split, 1)
@@ -83,13 +124,14 @@ def block(split: str, query_ids: pl.DataFrame, world_ids: pl.DataFrame, kf=KF, k
         w = s1.filter(pl.col("country") == cty).join(world_ids, on="entity_id")
         q = w.join(query_ids, on="entity_id")
         if q.height:
-            keys.append(_keys(w, q, pool.filter(pl.col("country") == cty)))
-    c = dc.join(pl.concat(keys), on=["s1", "m"], how="full", coalesce=True).with_columns(pl.col("in_fan").fill_null(False))
+            pc = pool.filter(pl.col("country") == cty)
+            keys.append(_keys(w, q, pc).join(_chargram(w, q, pc, cty), on=["s1", "m"], how="full", coalesce=True))
+    c = dc.join(pl.concat(keys, how="diagonal_relaxed"), on=["s1", "m"], how="full", coalesce=True).with_columns(pl.col("in_fan").fill_null(False))
     c = c.with_columns(pl.Series("d_cos", _cosine(c, split)))
     c = c.with_columns(pl.min_horizontal(
-        [pl.col(k).cast(pl.Int32).fill_null(BIG) for k in ("r_df", "r_dr", "r_h", "r_j")]
+        [pl.col(k).cast(pl.Int32).fill_null(BIG) for k in ("r_df", "r_dr", "r_h", "r_j", "r_cg")]
         + [pl.when(pl.col("in_fan")).then(pl.lit(1)).otherwise(BIG)]).alias("pri"))
     c = (c.sort(["s1", "pri", "d_cos"], descending=[False, False, True])
          .with_columns(pl.int_range(1, pl.len() + 1).over("s1").alias("_pos")).filter(pl.col("_pos") <= cap).drop("_pos"))
     step("block_v6", f"{split}: {c.height:,} pairs ({c.height / max(1, query_ids.height):.1f}/S1) in {time.time() - t0:.0f}s")
-    return c.select("s1", "m", "d_cos", "r_df", "r_dr", "r_h", "r_j", "in_fan", "pri")
+    return c.select("s1", "m", "d_cos", "r_df", "r_dr", "r_h", "r_j", "in_fan", "r_cg", "pri")

@@ -44,7 +44,7 @@ PARTS = 6
 N_FOLDS = 3
 FOLD_TRAIN_S1 = 400_000
 S2_TRAIN_S1 = 400_000
-BLK = (["d_cos", "r_df", "r_dr", "r_h", "r_j", "pri"] if C.V6 else
+BLK = (["d_cos", "r_df", "r_dr", "r_h", "r_j", "r_cg", "pri"] if C.V6 else
        ["s_a", "s_b", "s_c", "r_a", "r_b", "r_c", "r_e", "r_f", "r_g", "r_h", "r_j", "prio"])
 S2_FEATURES = ["p1", "lp1", "m_best_other", "m_gap", "m_rank", "m_n_hi", "m_n_cand",
                "s_rank", "s_top", "s_gap_top", "s_n_hi", "s_sum", "s_n_cand", "m_a_null"] + BLK
