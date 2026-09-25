@@ -95,6 +95,12 @@ def _not_bienc() -> pl.DataFrame:
                       tr.select(pl.col("entity_id").alias("s1")).sample(S2_TRAIN_S1, seed=C.SEED + 99)]).unique()
 
 
+def _bienc() -> pl.DataFrame:
+    """The bi-encoder's training S1s (as in ber.dense.data): is_train minus the v4 and stage-2 samples."""
+    tr = _split().filter(pl.col("is_train")).select(pl.col("entity_id").alias("s1"))
+    return tr.join(_not_bienc(), on="s1", how="anti")
+
+
 def oof(w: int):
     """Stage-1 scores: out-of-fold for training-portion S1s, v4 model for every other world S1."""
     sp = _split().filter(~pl.col("is_ghost")) if w == 20 else _split()
@@ -108,6 +114,8 @@ def oof(w: int):
         if C.V6:  # d_cos is in-sample for bi-encoder training S1s: fold models train only on S1s it never saw
             pool_f = pool_f.join(_not_bienc(), on="s1")
         others = pool_f.sample(min(FOLD_TRAIN_S1, pool_f.height), seed=C.SEED + f)
+        if C.V6:  # reviewer 17:13 UTC: fold-training S1s never trained the bi-encoder
+            assert others.join(_bienc(), on="s1").height == 0, "OOF fold training overlaps bi-encoder S1s"
         d = _read_parts(w, others, ["s1", "m"] + FEATURES).join(truth, on=["s1", "m"], how="left").with_columns(pl.col("y").fill_null(0))
         es_s1 = d.select("s1").unique().sort("s1").sample(fraction=0.1, seed=C.SEED)
         es, trn = d.join(es_s1, on="s1"), d.join(es_s1, on="s1", how="anti")
@@ -240,6 +248,8 @@ def fit(w: int = 20):
     step("stage2", f"fit features: {len(FEATS)} ({'with' if 'ce' in FEATS else 'without'} cross-encoder)")
     truth = load_train_pairs().select("s1", "m").with_columns(pl.lit(1, pl.Int8).alias("y"))
     tr_s1 = _split().filter(pl.col("is_train")).select(pl.col("entity_id").alias("s1")).sample(S2_TRAIN_S1, seed=C.SEED + 99)
+    if C.V6:  # reviewer 17:13 UTC: stage-2 fit S1s never trained the bi-encoder
+        assert tr_s1.join(_bienc(), on="s1").height == 0, "stage-2 fit sample overlaps bi-encoder S1s"
     d = d.join(tr_s1, on="s1").join(truth, on=["s1", "m"], how="left").with_columns(pl.col("y").fill_null(0))
     es_s1 = d.select("s1").unique().sort("s1").sample(fraction=0.1, seed=C.SEED)
     es, trn = d.join(es_s1, on="s1"), d.join(es_s1, on="s1", how="anti")
