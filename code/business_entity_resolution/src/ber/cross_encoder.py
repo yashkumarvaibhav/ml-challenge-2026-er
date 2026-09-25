@@ -1,7 +1,8 @@
 """Pretrained multilingual cross-encoder (GPU) used as a stage-2 feature on the uncertain band.
 
-Model: intfloat/multilingual-e5-small (MIT license, 117.7M parameters; README rule 5 allows MIT/Apache
-models <= 8B). Input: the RAW name + address of both records ("name | address"), so the multilingual
+Model: intfloat/multilingual-e5-small (MIT license, 117.7M parameters, revision 614241f6) by default;
+BER_CE=e5base selects intfloat/multilingual-e5-base (MIT, 278.0M, revision d1287505). The organizer FAQ
+allows MIT/Apache open-weight models <= 8B parameters, run offline, fine-tuned only on the provided data. Input: the RAW name + address of both records ("name | address"), so the multilingual
 pretraining can read French text and Indian scripts; mean-pooled encoder output -> linear -> logit.
 
 Leakage-safe data: trained on training-portion S1s from the v4 LightGBM training sample MINUS the
@@ -25,8 +26,12 @@ from .io import load_source, load_train_pairs
 from .progress import Progress, step
 
 os.environ.setdefault("TOKENIZERS_PARALLELISM", "true")
-BASE = C.ROOT / "models" / "hf" / "multilingual-e5-small"
-OUT = C.ROOT / "models" / "ce_e5small"
+CE_NAME = os.environ.get("BER_CE", "e5small")
+BASES = {"e5small": ("intfloat/multilingual-e5-small", "614241f622f53c4eeff9890bdc4f31cfecc418b3"),
+         "e5base": ("intfloat/multilingual-e5-base", "d128750597153bb5987e10b1c3493a34e5a4502a")}
+BASE = C.ROOT / "models" / "hf" / BASES[CE_NAME][0].split("/")[1]
+OUT = C.ROOT / "models" / f"ce_{CE_NAME}"
+SUFFIX = "" if CE_NAME == "e5small" else f"_{CE_NAME}"  # cache/report names of non-default CEs
 DATA = C.CACHE / "ce"
 MAX_LEN, BATCH, LR, NEG_PER_POS = 128, 256, 3e-5, 2
 BAND = (0.01, 0.995)
@@ -113,7 +118,7 @@ def train():
     sched = torch.optim.lr_scheduler.LambdaLR(opt, lambda s: min((s + 1) / warm, max(0.0, (steps - s) / (steps - warm))))
     lossf = torch.nn.BCEWithLogitsLoss()
     model.train()
-    prog = Progress("ce train (A6000)", n, unit="pairs")
+    prog = Progress(f"ce train {CE_NAME} (A6000)", n, unit="pairs")
     run = 0.0
     for b in range(steps):
         sl = slice(b * BATCH, (b + 1) * BATCH)
@@ -179,7 +184,7 @@ def evalband():
            "logloss_stage1": float(log_loss(y, np.clip(h["p"].to_numpy(), 1e-6, 1 - 1e-6))),
            "logloss_ce": float(log_loss(y, np.clip(ce, 1e-6, 1 - 1e-6))),
            "auc_avg": float(roc_auc_score(y, (ce + h["p"].to_numpy()) / 2))}
-    (C.EXPERIMENTS / "ce_evalband.json").write_text(json.dumps(rep, indent=2))
+    (C.EXPERIMENTS / f"ce_evalband{SUFFIX}.json").write_text(json.dumps(rep, indent=2))
     step("ce", "evalband: " + json.dumps(rep))
 
 
