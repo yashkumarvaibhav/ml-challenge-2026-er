@@ -21,6 +21,9 @@ HOLDOUT_SIZE = 200_000
 GHOST_FRAC = 0.20
 MATCH_BUCKETS = (0, 1, 2, 3, 4, 5)  # 6+ is the last bucket
 
+# Run name: model file models/lgb_<RUN>.txt (v1 = first submission, v2 = blocking v2).
+RUN = os.environ.get("BER_RUN", "v2")
+
 # Default CPU budget; override BER_PROCS for the local machine.
 N_PROCS = int(os.environ.get("BER_PROCS", "96"))
 

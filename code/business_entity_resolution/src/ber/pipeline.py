@@ -24,7 +24,7 @@ from .progress import step
 from .run_blocking import run_test as block_test
 from .run_blocking import run_train as block_train
 
-MODEL = C.ROOT / "models" / "lgb_v1.txt"
+MODEL = C.ROOT / "models" / f"lgb_{C.RUN}.txt"
 DECISION = C.EXPERIMENTS / "decision_params.json"
 
 
@@ -49,7 +49,7 @@ def train_fit():
     truth = load_train_pairs()
     f = label(pl.read_parquet(C.CACHE / "feats" / "train_w20.parquet"), truth)
     sp = _split()
-    booster = train(f, sp.filter(pl.col("is_train")).select("entity_id"), name="fit lgb_v1")
+    booster = train(f, sp.filter(pl.col("is_train")).select("entity_id"), name=f"fit lgb_{C.RUN}")
     MODEL.parent.mkdir(parents=True, exist_ok=True)
     booster.save_model(str(MODEL), num_iteration=booster.best_iteration)
     imp = sorted(zip(booster.feature_name(), booster.feature_importance("gain")), key=lambda x: -x[1])

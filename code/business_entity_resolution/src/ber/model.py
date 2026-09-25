@@ -16,7 +16,7 @@ from .features import FEATURES
 from .metrics import per_s1_f05, summarize
 from .progress import step
 
-PARAMS = dict(objective="binary", learning_rate=0.05, num_leaves=127, min_data_in_leaf=200,
+PARAMS = dict(objective="binary", learning_rate=0.08, num_leaves=127, min_data_in_leaf=200,
               feature_fraction=0.8, bagging_fraction=0.8, bagging_freq=1, lambda_l2=1.0,
               num_threads=int(os.environ.get("BER_LGB_THREADS", C.N_PROCS)), verbose=-1, seed=C.SEED)
 
@@ -31,7 +31,7 @@ def label(feats: pl.DataFrame, truth: pl.DataFrame) -> pl.DataFrame:
         .with_columns(pl.col("y").fill_null(0))
 
 
-def train(feats: pl.DataFrame, train_s1: pl.DataFrame, rounds: int = 2000, name: str = "lgb") -> lgb.Booster:
+def train(feats: pl.DataFrame, train_s1: pl.DataFrame, rounds: int = 3000, name: str = "lgb") -> lgb.Booster:
     d = feats.join(train_s1.select(pl.col("entity_id").alias("s1")), on="s1")
     s1s = d.select("s1").unique().sort("s1").sample(fraction=0.1, seed=C.SEED)
     es = d.join(s1s, on="s1")
@@ -46,7 +46,7 @@ def train(feats: pl.DataFrame, train_s1: pl.DataFrame, rounds: int = 2000, name:
             step(name, f"round {env.iteration}/{rounds} {res}")
 
     booster = lgb.train(PARAMS | {"metric": "binary_logloss"}, dtr, rounds, valid_sets=[des], valid_names=["es"],
-                        callbacks=[lgb.early_stopping(50, verbose=False), log_cb])
+                        callbacks=[lgb.early_stopping(100, verbose=False), log_cb])
     step(name, f"best iteration {booster.best_iteration}")
     return booster
 
