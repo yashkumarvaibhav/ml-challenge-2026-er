@@ -303,22 +303,47 @@ def ann_check(n_q: int = 4000, k: int = 50):
     step("dense", "ann_check: " + json.dumps(rep))
 
 
-def _union(dc, old, KF, KR, CAP, with_hj):
-    """Production-style candidate set: dense forward <= KF, dense reverse <= KR, optionally the exact
-    name+number keys (h, j <= 10); ordered by best channel rank then cosine; final cap CAP per S1."""
+def _union(ch, KF, KR, CAP, extra):
+    """Production-style candidate set from the channel table `ch` (one row per pair, channel rank columns):
+    dense forward <= KF, dense reverse <= KR, plus `extra` channels ('hj' = exact name+number keys h/j <= 10,
+    'n' = address-null exact-name fan-out, 'cg' = address-null char-3-gram name retrieval top 3);
+    ordered by the best channel rank, then bi-encoder cosine; final cap CAP per S1."""
     big = 10_000
-    d = dc.filter((pl.col("r_df") <= KF) | (pl.col("r_dr") <= KR)).with_columns(
-        pl.when(pl.col("r_df") <= KF).then(pl.col("r_df")).otherwise(None).alias("r_df"),
-        pl.when(pl.col("r_dr") <= KR).then(pl.col("r_dr")).otherwise(None).alias("r_dr"))
-    if with_hj:
-        hj = old.filter(pl.col("r_h").is_not_null() | pl.col("r_j").is_not_null()).select("s1", "m", "r_h", "r_j")
-        d = d.join(hj, on=["s1", "m"], how="full", coalesce=True)
-    else:
-        d = d.with_columns(pl.lit(None, pl.Int16).alias("r_h"), pl.lit(None, pl.Int16).alias("r_j"))
-    d = d.with_columns(pl.min_horizontal([pl.col(c).cast(pl.Int32).fill_null(big) for c in ("r_df", "r_dr", "r_h", "r_j")]).alias("pri"))
+    keep = (pl.col("r_df") <= KF) | (pl.col("r_dr") <= KR)
+    ranks = [pl.when(pl.col("r_df") <= KF).then(pl.col("r_df").cast(pl.Int32)), pl.when(pl.col("r_dr") <= KR).then(pl.col("r_dr").cast(pl.Int32))]
+    if "hj" in extra:
+        keep = keep | pl.col("r_h").is_not_null() | pl.col("r_j").is_not_null()
+        ranks += [pl.col("r_h").cast(pl.Int32), pl.col("r_j").cast(pl.Int32)]
+    if "n" in extra:
+        keep = keep | pl.col("in_fan")
+        ranks += [pl.when(pl.col("in_fan")).then(pl.lit(1, pl.Int32))]
+    if "cg" in extra:
+        keep = keep | (pl.col("r_cg") <= 3)
+        ranks += [pl.when(pl.col("r_cg") <= 3).then(pl.col("r_cg").cast(pl.Int32))]
+    d = ch.filter(keep.fill_null(False)).with_columns(pl.min_horizontal([r.fill_null(big) for r in ranks]).alias("pri"))
     d = d.sort(["s1", "pri", "d_cos"], descending=[False, False, True], nulls_last=True) \
         .with_columns(pl.int_range(1, pl.len() + 1).over("s1").alias("pos")).filter(pl.col("pos") <= CAP)
     return d.select("s1", "m")
+
+
+def _channels(dc, old, w, hold, sp):
+    """All channel ranks for holdout S1s in world w: dense (dc), old h/j keys, fan-out, char-gram."""
+    from .blocking_v6 import FAN, _cosine
+    ch = dc.select("s1", "m", "r_df", "r_dr")
+    ch = ch.join(old.filter(pl.col("r_h").is_not_null() | pl.col("r_j").is_not_null()).select("s1", "m", "r_h", "r_j"), on=["s1", "m"], how="full", coalesce=True)
+    world = (sp.filter(~pl.col("is_ghost")) if w == 20 else sp).select(pl.col("entity_id").alias("s1"))
+    r1 = pl.read_parquet(C.CACHE / "norm_final" / "train_s1.parquet", columns=["entity_id", "country", "n_str"]).rename({"entity_id": "s1", "n_str": "k"}).join(world, on="s1")
+    pool = pl.concat([pl.read_parquet(C.CACHE / "norm_final" / f"train_s{s}.parquet", columns=["entity_id", "country", "n_str", "a_null"]) for s in (2, 3)])
+    small = r1.filter(pl.col("k") != "").group_by("country", "k").len().filter(pl.col("len") <= FAN).select("country", "k")
+    nullp = pool.filter(pl.col("a_null")).select(pl.col("entity_id").alias("m"), "country", pl.col("n_str").alias("k")).join(small, on=["country", "k"])
+    fan = r1.join(hold.select("s1"), on="s1").join(nullp, on=["country", "k"]).select("s1", "m", pl.lit(True).alias("in_fan"))
+    ch = ch.join(fan, on=["s1", "m"], how="full", coalesce=True).with_columns(pl.col("in_fan").fill_null(False))
+    cgp = DATA / f"holdout_w{w}_chargram_null.parquet"
+    if cgp.exists():
+        ch = ch.join(pl.read_parquet(cgp).select("s1", "m", "r_cg"), on=["s1", "m"], how="full", coalesce=True).with_columns(pl.col("in_fan").fill_null(False))
+    else:
+        ch = ch.with_columns(pl.lit(None, pl.Int16).alias("r_cg"))
+    return ch.with_columns(pl.Series("d_cos", _cosine(ch, "train")))
 
 
 def recall_report(worlds=(20, 0)):
@@ -358,17 +383,18 @@ def recall_report(worlds=(20, 0)):
         old = pl.read_parquet(C.CACHE / "cand" / f"train_w{w}.parquet").join(hold.select("s1"), on="s1")
         oldt = old.select("s1", "m").join(truth, on=["s1", "m"])
         rep[f"w{w} old rule-based (cap 70)"] = stats(old.select("s1", "m"), "old", halves=True)
+        ch = _channels(dc, old, w, hold, sp)
         rows = []
         for KF in (10, 20, 30):
             for KR in (2, 5):
-                for with_hj in (False, True):
+                for extra in ("", "hj", "hj+n+cg"):
                     for CAP in (15, 20, 25, 30, 40):
-                        u = _union(dc, old, KF, KR, CAP, with_hj)
+                        u = _union(ch, KF, KR, CAP, extra)
                         st = stats(u, "")
                         ut = u.join(truth, on=["s1", "m"])
                         st["rescued_vs_old"] = ut.join(oldt, on=["s1", "m"], how="anti").height
                         st["displaced_vs_old"] = oldt.join(ut, on=["s1", "m"], how="anti").height
-                        key = f"w{w} dense fwd{KF} rev{KR}{' +h/j' if with_hj else ''} cap{CAP}"
+                        key = f"w{w} dense fwd{KF} rev{KR}{' +' + extra if extra else ''} cap{CAP}"
                         rep[key] = st
                         rows.append((key, st))
                         step("dense", f"{key}: mean {st['mean_per_s1']}/S1 recall {st['pair_recall']} oracle {st['oracle']}")
@@ -376,7 +402,8 @@ def recall_report(worlds=(20, 0)):
         for CAP in (15, 20, 25, 30, 40):
             key, _ = max([(k, s) for k, s in rows if k.endswith(f"cap{CAP}")], key=lambda x: x[1]["oracle"])
             KF, KR = int(key.split("fwd")[1].split()[0]), int(key.split("rev")[1].split()[0])
-            rep[key].update({k: v for k, v in stats(_union(dc, old, KF, KR, CAP, "+h/j" in key), "", halves=True).items() if k.startswith("oracle_half")})
+            extra = key.split(" +")[1].split(" ")[0] if " +" in key else ""
+            rep[key].update({k: v for k, v in stats(_union(ch, KF, KR, CAP, extra), "", halves=True).items() if k.startswith("oracle_half")})
             rep[f"w{w} best at cap{CAP}"] = key
         (C.EXPERIMENTS / "dense_recall_report.json").write_text(json.dumps(rep, indent=1))
     step("dense", "recall_report: " + json.dumps({k: (v if isinstance(v, str) else {x: v.get(x) for x in ("mean_per_s1", "pair_recall", "oracle", "oracle_halfA", "oracle_halfB")})

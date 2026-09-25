@@ -27,10 +27,10 @@ def _chunk(b):
     return hi - lo, (r + lo, c, v, rk)
 
 
-def main():
+def main(w: int = 20):
     sp = pl.read_parquet(C.CACHE / "splits" / "train_s1_split.parquet")
     hold = sp.filter(pl.col("is_holdout") & ~pl.col("is_ghost")).select(pl.col("entity_id").alias("s1"))
-    world = sp.filter(~pl.col("is_ghost")).select(pl.col("entity_id").alias("s1"))
+    world = (sp.filter(~pl.col("is_ghost")) if w == 20 else sp).select(pl.col("entity_id").alias("s1"))
     r1 = pl.read_parquet(C.CACHE / "norm_final" / "train_s1.parquet", columns=["entity_id", "country", "n_str"]).rename({"entity_id": "s1"}).join(world, on="s1")
     pool = pl.concat([pl.read_parquet(C.CACHE / "norm_final" / f"train_s{s}.parquet", columns=["entity_id", "country", "n_str", "a_null"]) for s in (2, 3)])
     nullp = pool.filter(pl.col("a_null") & (pl.col("n_str") != "")).rename({"entity_id": "m"})
@@ -55,17 +55,18 @@ def main():
              .join(w.select("s1").with_row_index("wi").with_columns(pl.col("wi").cast(pl.Int64)), on="wi").select("s1", "m", "cg", "r_cg")
         outs.append(g.join(hold, on="s1"))
     cg = pl.concat(outs)
-    cg.write_parquet(C.CACHE / "dense" / "holdout_w20_chargram_null.parquet")
+    cg.write_parquet(C.CACHE / "dense" / f"holdout_w{w}_chargram_null.parquet")
     truth = load_train_pairs().select("s1", "m").join(hold, on="s1").join(nullp.select("m"), on="m")
-    old = pl.read_parquet(C.CACHE / "cand" / "train_w20.parquet", columns=["s1", "m"]).join(hold, on="s1")
+    old = pl.read_parquet(C.CACHE / "cand" / f"train_w{w}.parquet", columns=["s1", "m"]).join(hold, on="s1")
     rep = {"null_record_true_pairs": truth.height, "old_found": truth.join(old, on=["s1", "m"]).height}
     for k in (1, 2, 3, 5, 10):
         x = cg.filter(pl.col("r_cg") <= k).select("s1", "m")
         rep[f"chargram top{k}"] = {"pairs_per_holdout_s1": round(x.height / hold.height, 3), "true_found": truth.join(x, on=["s1", "m"]).height,
                                    "rescued_vs_old": truth.join(x, on=["s1", "m"]).join(old, on=["s1", "m"], how="anti").height}
-    (C.EXPERIMENTS / "chargram_null_w20.json").write_text(json.dumps(rep, indent=1))
+    (C.EXPERIMENTS / f"chargram_null_w{w}.json").write_text(json.dumps(rep, indent=1))
     step("chargram", json.dumps(rep))
 
 
 if __name__ == "__main__":
-    main()
+    import sys
+    main(int(sys.argv[1]) if len(sys.argv) > 1 else 20)
