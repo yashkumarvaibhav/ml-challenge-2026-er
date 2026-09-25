@@ -14,7 +14,9 @@ stage-1 scores over the whole candidate universe (every rival S1 present, as on 
 Cross-fitting (no leakage):
 * training-portion S1s get OUT-OF-FOLD stage-1 scores (3 folds; each fold model trained on <= 400k
   training-portion S1s from the other folds, v4 features/params);
-* holdout S1s are scored by the v4 model (trained on training-portion S1s only), exactly like test.
+* every other world S1 (holdout, and in world 0 also the non-holdout ghost S1s) is scored by the v4
+  model (trained on training-portion S1s only), exactly like test; coverage of the whole candidate
+  universe is asserted before competition features are built.
 
 Steps (world20 = ghosts removed; resumable):
   python -m ber.stage2 --steps feats,oof,s2feats,fit,eval --world 20
@@ -86,7 +88,7 @@ def _read_parts(w, s1_filter: pl.DataFrame = None, cols=None):
 
 
 def oof(w: int):
-    """Stage-1 scores: out-of-fold for training-portion S1s, v4 model for holdout S1s."""
+    """Stage-1 scores: out-of-fold for training-portion S1s, v4 model for every other world S1."""
     sp = _split().filter(~pl.col("is_ghost")) if w == 20 else _split()
     truth = load_train_pairs().select("s1", "m").with_columns(pl.lit(1, pl.Int8).alias("y"))
     tr = sp.filter(pl.col("is_train")).select(pl.col("entity_id").alias("s1")) \
@@ -109,15 +111,44 @@ def oof(w: int):
             x = pl.read_parquet(S2 / f"feats_w{w}" / f"part{k}.parquet", columns=["s1", "m"] + FEATURES).join(fold_s1, on="s1")
             scored.append(x.select("s1", "m").with_columns(
                 pl.Series("p1", booster.predict(x.select(FEATURES).to_numpy(), num_iteration=booster.best_iteration))))
-    step("stage2", "holdout S1s: scoring with the v4 model ...")
-    v4 = lgb.Booster(model_file=str(MODEL_V4))
-    hold = sp.filter(pl.col("is_holdout")).select(pl.col("entity_id").alias("s1"))
-    for k in range(PARTS):
-        x = pl.read_parquet(S2 / f"feats_w{w}" / f"part{k}.parquet", columns=["s1", "m"] + FEATURES).join(hold, on="s1")
-        scored.append(x.select("s1", "m").with_columns(pl.Series("p1", v4.predict(x.select(FEATURES).to_numpy()))))
-    out = pl.concat(scored)
+    out = pl.concat(scored + [_v4_scores(w, sp.filter(~pl.col("is_train")).select(pl.col("entity_id").alias("s1")))])
+    _assert_coverage(out, w)
     out.write_parquet(S2 / f"stage1_w{w}.parquet")
     step("stage2", f"stage-1 scores written: {out.height:,} pairs")
+
+
+def _v4_scores(w: int, s1: pl.DataFrame) -> pl.DataFrame:
+    """v4 stage-1 scores for S1s outside the training portion (holdout AND, in world 0, the
+    non-holdout ghost S1s): v4 never trained on them, so they are scored exactly like test."""
+    step("stage2", f"non-training S1s ({s1.height:,}): scoring with the v4 model ...")
+    v4 = lgb.Booster(model_file=str(MODEL_V4))
+    out = []
+    for k in range(PARTS):
+        x = pl.read_parquet(S2 / f"feats_w{w}" / f"part{k}.parquet", columns=["s1", "m"] + FEATURES).join(s1, on="s1")
+        out.append(x.select("s1", "m").with_columns(pl.Series("p1", v4.predict(x.select(FEATURES).to_numpy()))))
+    return pl.concat(out)
+
+
+def _assert_coverage(st: pl.DataFrame, w: int):
+    """Every candidate pair of the world universe has exactly one stage-1 score (else rival features are wrong)."""
+    cand = pl.read_parquet(C.CACHE / "cand" / f"train_full_w{w}.parquet", columns=["s1", "m"])
+    dup = st.height - st.select("s1", "m").unique().height
+    missing = cand.join(st, on=["s1", "m"], how="anti").height
+    extra = st.join(cand, on=["s1", "m"], how="anti").height
+    assert dup == 0 and missing == 0 and extra == 0, f"stage-1 coverage w{w}: dup {dup}, missing {missing}, extra {extra}"
+    step("stage2", f"stage-1 coverage w{w} OK: {st.height:,} pairs = candidate universe, unique")
+
+
+def fill(w: int):
+    """Repair an existing stage1_w{w}.parquet written before the coverage fix: add v4 scores for
+    world S1s that have none (world-0 non-holdout ghosts), then assert coverage."""
+    st = pl.read_parquet(S2 / f"stage1_w{w}.parquet")
+    sp = _split().filter(~pl.col("is_ghost")) if w == 20 else _split()
+    todo = sp.filter(~pl.col("is_train")).select(pl.col("entity_id").alias("s1")).join(st.select("s1").unique(), on="s1", how="anti")
+    if todo.height:
+        st = pl.concat([st, _v4_scores(w, todo)])
+    _assert_coverage(st, w)
+    st.write_parquet(S2 / f"stage1_w{w}.parquet")
 
 
 def ce_train_universe(w: int):
@@ -182,6 +213,7 @@ def _a_null(split):
 
 def s2feats(w: int):
     st = pl.read_parquet(S2 / f"stage1_w{w}.parquet")
+    _assert_coverage(st, w)
     cand = pl.read_parquet(C.CACHE / "cand" / f"train_full_w{w}.parquet")
     step("stage2", f"competition features over {st.height:,} pairs ...")
     _with_ce(s2_features(st, cand, _a_null("train")), S2 / f"ce_w{w}.parquet").write_parquet(S2 / f"s2feats_w{w}.parquet")
@@ -252,7 +284,7 @@ if __name__ == "__main__":
     a = ap.parse_args()
     S2.mkdir(parents=True, exist_ok=True)
     t0 = time.time()
-    fns = {"feats": feats, "oof": oof, "ce": ce_train_universe, "s2feats": s2feats, "fit": fit, "eval": evaluate,
+    fns = {"feats": feats, "oof": oof, "fill": fill, "ce": ce_train_universe, "s2feats": s2feats, "fit": fit, "eval": evaluate,
            "cetest": lambda w: ce_test(), "test": lambda w: test()}
     for s in a.steps.split(","):
         step("stage2", f"step {s} (world{a.world}) ...")
