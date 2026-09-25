@@ -39,7 +39,8 @@ BASE = C.ROOT / "models" / "hf" / BASES[CE_NAME][0].split("/")[1]
 OUT = C.ROOT / "models" / f"ce_{CE_NAME}"
 SUFFIX = "" if CE_NAME == "e5small" else f"_{CE_NAME}"  # cache/report names of non-default CEs
 DATA = C.CACHE / "ce"
-MAX_LEN, BATCH, LR, NEG_PER_POS = 128, 256, 3e-5, 2
+MAX_LEN, LR, NEG_PER_POS = 128, 3e-5, 2
+BATCH = int(os.environ.get("BER_CE_BATCH", "256"))
 BAND = (0.01, 0.995)
 
 
@@ -59,6 +60,8 @@ class CrossEncoder(torch.nn.Module):
         else:
             self.enc = AutoModel.from_pretrained(base)
             self.head = torch.nn.Linear(self.enc.config.hidden_size, 1)
+        if CE_NAME in ("bgerr", "e5large"):  # ~560M-parameter models: trade compute for activation memory
+            self.enc.gradient_checkpointing_enable()
 
     def forward(self, input_ids, attention_mask):
         if SEQCLS:
