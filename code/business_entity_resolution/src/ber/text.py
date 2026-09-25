@@ -12,6 +12,7 @@ Each rule, with its basis in the supplied files:
 * split on other punctuation incl. "-" and "/": "Tri-State", "40/3", "C/O".
 * numbers lose leading zeros: "0040" vs "40" (seen in train pairs).
 * S3 placeholders "NULL"/"<NULL>" dropped.
+* "N°" / "Nº" number prefixes -> "No" (French test records write "N° 106"; India uses "No 106").
 * "X dba/aka/fka/t/a/... Y": the S1 name is the part after the marker (20k/20k
   sampled train pairs), so Y is the main name and X goes to the alt field.
 * "Name | www.site.com": the part before "|" is the main name.
@@ -36,6 +37,7 @@ DBA = re.compile(
 )
 DOMAIN_WORD = re.compile(r"^(?:www\.)?([^\s]+?)\.(?:com|net|org)$", re.IGNORECASE)
 PLACEHOLDER = re.compile(r"<\s*null\s*>|\bnull\b", re.IGNORECASE)
+NUMERO = re.compile(r"\b[Nn]\s*[°º]\s*")
 LATIN_LETTER = re.compile(r"[A-Za-z]")
 
 
@@ -141,7 +143,7 @@ def addr_components(raw: str) -> list:
     """Comma-separated components with placeholders removed (raw text)."""
     if not raw:
         return []
-    s = PLACEHOLDER.sub(" ", unicodedata.normalize("NFKC", raw))
+    s = NUMERO.sub("No ", PLACEHOLDER.sub(" ", unicodedata.normalize("NFKC", raw)))
     return [c.strip() for c in s.split(",") if c.strip()]
 
 
