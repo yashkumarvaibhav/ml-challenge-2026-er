@@ -85,12 +85,27 @@ def data():
     step("ce", f"data: {ce_s1.height:,} S1s, {tr.height:,} pairs (pos {int(tr['y'].sum()):,})")
 
 
+def pretokenize(t1, t2, tok, name):
+    """Tokenize all pairs once into fixed-length int32 arrays (the GPU loop then only slices)."""
+    n = len(t1)
+    ids = np.zeros((n, MAX_LEN), np.int32)
+    mask = np.zeros((n, MAX_LEN), np.int8)
+    prog = Progress(name, n, unit="pairs")
+    for b in range(0, n, 50_000):
+        enc = tok(t1[b:b + 50_000], t2[b:b + 50_000], truncation=True, max_length=MAX_LEN, padding="max_length", return_tensors="np")
+        ids[b:b + 50_000], mask[b:b + 50_000] = enc["input_ids"], enc["attention_mask"]
+        prog.update(len(t1[b:b + 50_000]))
+    prog.done()
+    return ids, mask
+
+
 def train():
     dev = device()
     tok = AutoTokenizer.from_pretrained(BASE)
     model = CrossEncoder().to(dev)
     d = pl.read_parquet(DATA / "train_pairs.parquet").sample(fraction=1.0, shuffle=True, seed=C.SEED + 5)  # joins may reorder
     t1, t2, y = d["t1"].to_list(), d["t2"].to_list(), torch.tensor(d["y"].to_numpy(), dtype=torch.float32)
+    ids_np, mask_np = pretokenize(t1, t2, tok, "ce tokenize train")
     n = len(t1)
     steps = math.ceil(n / BATCH)
     opt = torch.optim.AdamW(model.parameters(), lr=LR, weight_decay=0.01)
@@ -102,9 +117,12 @@ def train():
     run = 0.0
     for b in range(steps):
         sl = slice(b * BATCH, (b + 1) * BATCH)
-        enc = tok(t1[sl], t2[sl], truncation=True, max_length=MAX_LEN, padding=True, return_tensors="pt").to(dev)
+        m_np = mask_np[sl]
+        L = int(m_np.sum(1).max())  # trim padding to the longest row in the batch
+        ids = torch.from_numpy(ids_np[sl, :L].astype(np.int64)).to(dev, non_blocking=True)
+        am = torch.from_numpy(m_np[:, :L].astype(np.int64)).to(dev, non_blocking=True)
         with torch.autocast("cuda", dtype=torch.bfloat16):
-            logit = model(enc["input_ids"], enc["attention_mask"])
+            logit = model(ids, am)
         loss = lossf(logit.float(), y[sl].to(dev))
         opt.zero_grad(set_to_none=True)
         loss.backward()
@@ -112,7 +130,7 @@ def train():
         opt.step()
         sched.step()
         run = 0.98 * run + 0.02 * loss.item() if b else loss.item()
-        prog.update(len(t1[sl]))
+        prog.update(ids.shape[0])
         if b % 500 == 0:
             step("ce", f"step {b}/{steps} loss {run:.4f} lr {sched.get_last_lr()[0]:.2e}")
     prog.done()
@@ -133,13 +151,17 @@ def score(pairs: pl.DataFrame, split: str, name: str = "ce score", batch: int = 
     d = with_text(pairs.with_row_index("_i"), split).sort("_i")
     assert d.height == pairs.height, "text join lost rows"
     t1, t2 = d["t1"].to_list(), d["t2"].to_list()
+    ids_np, mask_np = pretokenize(t1, t2, tok, name + " (tokenize)")
     out = np.empty(len(t1), np.float32)
     prog = Progress(name, len(t1), unit="pairs")
     for b in range(0, len(t1), batch):
-        enc = tok(t1[b:b + batch], t2[b:b + batch], truncation=True, max_length=MAX_LEN, padding=True, return_tensors="pt").to(dev)
+        m_np = mask_np[b:b + batch]
+        L = int(m_np.sum(1).max())
+        ids = torch.from_numpy(ids_np[b:b + batch, :L].astype(np.int64)).to(dev)
+        am = torch.from_numpy(m_np[:, :L].astype(np.int64)).to(dev)
         with torch.autocast("cuda", dtype=torch.bfloat16):
-            out[b:b + batch] = torch.sigmoid(model(enc["input_ids"], enc["attention_mask"]).float()).cpu().numpy()
-        prog.update(len(t1[b:b + batch]))
+            out[b:b + batch] = torch.sigmoid(model(ids, am).float()).cpu().numpy()
+        prog.update(ids.shape[0])
     prog.done()
     return out
 
