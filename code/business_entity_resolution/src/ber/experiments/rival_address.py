@@ -21,7 +21,7 @@ from ..model import decide
 
 LEG = ["sarl", "sas", "sasu", "sa", "eurl", "ei", "sci", "snc", "llc", "inc", "ltd", "corp", "co", "pvt", "private", "limited",
        "s", "a", "r", "l", "u", "e", "i"]
-MARGIN, MIN_RIV = 10, 80
+MARGIN, MIN_RIV, MAX_NAME = 10, 80, 30
 
 
 def core(c):
@@ -42,7 +42,10 @@ def flag(acc: pl.DataFrame, s1: pl.DataFrame, rec: pl.DataFrame) -> pl.DataFrame
     s1 = s1.with_columns(core("n1").alias("k"))
     rec = rec.with_columns(core("n2").alias("km")).filter(pl.col("a2").is_not_null())
     x = acc.join(s1, on="s1").join(rec, on="m").filter(pl.col("k") == pl.col("km"))
-    riv = s1.select(pl.col("s1").alias("r"), "country", "k", pl.col("a1").alias("ar"))
+    # bounded: names shared by <= MAX_NAME S1s (very common names give no usable rival signal and explode the join)
+    nk = s1.group_by("country", "k").len().filter((pl.col("len") >= 2) & (pl.col("len") <= MAX_NAME)).select("country", "k")
+    x = x.join(nk, on=["country", "k"])
+    riv = s1.join(nk, on=["country", "k"]).select(pl.col("s1").alias("r"), "country", "k", pl.col("a1").alias("ar"))
     y = x.join(riv, on=["country", "k"]).filter(pl.col("r") != pl.col("s1"))
     if y.height == 0:
         return y.select("s1", "m")
@@ -57,12 +60,12 @@ def main():
     t1 = pl.read_parquet(C.CACHE / "test_source1.parquet").select(pl.col("entity_id").alias("s1"), "country", pl.col("business_name").alias("n1"), pl.col("business_address").alias("a1"))
     rec = pl.concat([pl.read_parquet(C.CACHE / f"test_source{s}.parquet") for s in (2, 3)]).select(pl.col("entity_id").alias("m"), pl.col("business_name").alias("n2"), pl.col("business_address").alias("a2"))
     p = pl.read_parquet(C.WORK / "s2" / "test_pred_e5base2_frveto.parquet")
-    acc = decide(p, 0.4, 0.75)
-    d = flag(acc, t1, rec)
+    acc = decide(p, 0.4, 0.75).join(t1.filter(pl.col("country") == "France").select("s1"), on="s1")
+    d = flag(acc, t1.filter(pl.col("country") == "France"), rec)
     d.write_parquet(C.WORK / "s2" / "rival_address_drops_test.parquet")
     dc = d.join(t1.select("s1", "country"), on="s1")
-    rep["test"] = {c: {"pairs": dc.filter(pl.col("country") == c).height, "S1": dc.filter(pl.col("country") == c)["s1"].n_unique()} for c in ("US", "India", "France")}
-    print("test", rep["test"], flush=True)
+    rep["test France"] = {"pairs": dc.height, "S1": dc["s1"].n_unique()}
+    print("test France", rep["test France"], flush=True)
     sp = pl.read_parquet(C.CACHE / "splits" / "train_s1_split.parquet")
     hold = sp.filter(pl.col("is_holdout") & ~pl.col("is_ghost")).select(pl.col("entity_id").alias("s1"), "country", "holdout_half")
     truth = load_train_pairs().select("s1", "m")
