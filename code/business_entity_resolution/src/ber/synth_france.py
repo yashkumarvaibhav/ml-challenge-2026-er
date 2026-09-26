@@ -26,7 +26,7 @@ import polars as pl
 
 from . import config as C
 
-GHOST_FRAC, SIB_FRAC, NAME_FRAC, NEW_FRAC = 0.20, 0.25, 0.10, 0.15
+GHOST_FRAC, SIB_FRAC, NAME_FRAC, NEW_FRAC = 0.20, 0.10, 0.10, 0.10  # v2: calibrated on synfr_calib.json
 LEGAL = {"sarl": ["SARL", "S.A.R.L.", "Sarl", "(SARL)", "[SARL]", "5ARL", "Sàrl", "S.A.R.L"],
          "sas": ["SAS", "S.A.S.", "Sas", "(SAS)", "5AS", "S.A.S"], "sasu": ["SASU", "S.A.S.U.", "Sasu", "5ASU"],
          "sa": ["SA", "S.A.", "Sa"], "eurl": ["EURL", "E.U.R.L.", "Eurl"], "ei": ["EI", "E.I.", "(EI)"],
@@ -86,13 +86,13 @@ class Gen:
             return w[:i] + self.r.choice("aeioulnrst") + w[i:]
         return w[:i] + self.r.choice("aeioulnrst") + w[i + 1:]
 
-    def name(self, n):
+    def name(self, n, addr_null=False):
         toks = n.split()
         legal_idx = [i for i, t in enumerate(toks) if strip_acc(t).lower().strip("()[]").replace(".", "") in LEGAL]
         core = [t for i, t in enumerate(toks) if i not in legal_idx]
         if not core:
             core = toks[:]
-        if self.ch(0.075):  # whole-name replacement
+        if not addr_null and self.ch(0.12):  # whole-name replacement (never on address-less records; v2 rate)
             x = self.r.random()
             if x < 0.33:
                 return self.pseudo()
@@ -231,9 +231,10 @@ class Gen:
                     toks[0] = self.r.choice(NUM_FMT).format(n=n) + m.group(2)
                 else:
                     toks[0] = str(n) + m.group(2)
-        if len(toks) > 1 and self.ch(0.18):
-            i = self.r.randrange(1, len(toks))
-            toks[i] = self.typo(toks[i])
+        for _ in range(2):  # v2: French street names are typo'd far more often (real accepted street-differs 6.9%)
+            if len(toks) > 1 and self.ch(0.3):
+                i = self.r.randrange(1, len(toks))
+                toks[i] = self.typo(toks[i])
         return " ".join(toks)
 
 
@@ -305,7 +306,8 @@ def main(seed: int = 7):
                 else:
                     mid = f"SF3-{c3}"
                     c3 += 1
-                rec = {"entity_id": mid, "business_name": g.name(n), "business_address": g.address(a, src, city_streets), "country": "France"}
+                addr = g.address(a, src, city_streets)
+                rec = {"entity_id": mid, "business_name": g.name(n, addr is None), "business_address": addr, "country": "France"}
                 (recs2 if src == 2 else recs3).append(rec)
                 if kind == "s1" and idx not in ghost:
                     truth.append((eid, mid))
