@@ -27,6 +27,7 @@ import polars as pl
 from . import config as C
 
 GHOST_FRAC, SIB_FRAC, NAME_FRAC, NEW_FRAC = 0.20, 0.10, 0.10, 0.10  # v2: calibrated on synfr_calib.json
+RATES = {"whole": 0.12, "st_typo": 0.3, "fill_sub": 0.03, "sib_whole": True}  # overridable per simulator (stress test)
 LEGAL = {"sarl": ["SARL", "S.A.R.L.", "Sarl", "(SARL)", "[SARL]", "5ARL", "Sàrl", "S.A.R.L"],
          "sas": ["SAS", "S.A.S.", "Sas", "(SAS)", "5AS", "S.A.S"], "sasu": ["SASU", "S.A.S.U.", "Sasu", "5ASU"],
          "sa": ["SA", "S.A.", "Sa"], "eurl": ["EURL", "E.U.R.L.", "Eurl"], "ei": ["EI", "E.I.", "(EI)"],
@@ -37,6 +38,7 @@ FILL_ADD = ["& Fils", "Et Fils", "& Associés", "+ Associés", "France", "Dével
 SYL = ["flux", "vera", "pyra", "rax", "gild", "brix", "quo", "novi", "jax", "lyra", "zeph", "umbra", "ira", "dova",
        "kor", "syn", "halo", "delta", "vio", "ecto", "arc", "orbi", "iri", "calo", "xylo", "onyx", "tavo", "cira",
        "nex", "lum", "drex", "evo", "zeta", "wex", "vantage", "mira", "belo", "fay", "kelo", "aria", "sol", "avi"]
+ABBR = {"compagnie": ["Cie", "Cie."], "cie": ["Compagnie"], "etablissements": ["Ets", "Ets."], "ets": ["Établissements"], "saint": ["St", "St."], "sainte": ["Ste"]}
 WRAP = ["{p} doing business as {n}", "{p} a/k/a {n}", "{p} formerly: {n}", "{p} DBA: {n}", "{n} (formerly {p})"]
 ACC = {"a": "àâ", "e": "éèêë", "i": "ïî", "o": "ôö", "u": "ûù", "c": "ç"}
 LEET = {"o": "0", "l": "1", "s": "5", "i": "1", "e": "3"}
@@ -44,11 +46,10 @@ STREET_ABBR = {"rue": ["R", "R.", "RUE", "Rue"], "avenue": ["AV", "Av.", "AVE", 
                "allée": ["ALL", "All.", "ALLEE", "Allee"], "allee": ["ALL", "All."], "impasse": ["IMP", "Imp."], "place": ["PL", "Pl.", "PL."],
                "chemin": ["CH", "Ch.", "CHEM"], "route": ["RTE", "Rte", "Rte."], "quai": ["Q", "QU."], "cours": ["CRS", "Crs"], "square": ["SQ", "Sq."]}
 NUM_FMT = ["N° {n}", "No. {n}", "No {n}", "Nº {n}", "#{n}", "# {n}", "({n})", "{n} -", "0{n}", "00{n}", "N°{n}", "NO. {n}"]
-DEPT = {"lille": "Nord", "tourcoing": "Nord", "roubaix": "Nord", "dunkerque": "Nord", "calais": "Pas-de-Calais",
-        "bordeaux": "Gironde", "pessac": "Gironde", "mérignac": "Gironde", "merignac": "Gironde", "la teste-de-buch": "Gironde",
-        "lège-cap-ferret": "Gironde", "nantes": "Loire-Atlantique", "saint-nazaire": "Loire-Atlantique", "pornic": "Loire-Atlantique",
-        "saint-herblain": "Loire-Atlantique", "la baule-escoublac": "Loire-Atlantique"}
-REGIONS = {"hauts-de-france", "nouvelle-aquitaine", "pays de la loire"}
+# city -> department and the region names are DERIVED from the supplied France records in derive_geo() (reviewer
+# 26 Sep 16:45: no hard-coded gazetteer); filled at the start of main()
+DEPT = {}
+REGIONS = set()
 
 
 def strip_acc(s):
@@ -61,6 +62,7 @@ def capwords(s):
 
 class Gen:
     def __init__(self, seed, cats, cat_w):
+        self.allow_whole = True
         self.r = random.Random(seed)
         self.cats, self.cat_w = cats, cat_w
 
@@ -92,7 +94,7 @@ class Gen:
         core = [t for i, t in enumerate(toks) if i not in legal_idx]
         if not core:
             core = toks[:]
-        if not addr_null and self.ch(0.12):  # whole-name replacement (never on address-less records; v2 rate)
+        if not addr_null and self.allow_whole and self.ch(RATES["whole"]):  # whole-name replacement (never on address-less records)
             x = self.r.random()
             if x < 0.33:
                 return self.pseudo()
@@ -126,8 +128,12 @@ class Gen:
         if len(cidx) >= 2 and self.ch(0.08):
             out.pop(self.r.choice(cidx))
         cidx = [i for i, t in enumerate(out) if strip_acc(t).lower().strip("()[]").replace(".", "") not in LEGAL]
-        if len(cidx) >= 2 and self.ch(0.03):
+        if len(cidx) >= 2 and self.ch(RATES["fill_sub"]):
             out[self.r.choice(cidx)] = self.r.choice(FILL_SUB)
+        for i, t in enumerate(out):  # v3: abbreviation noise seen in real France records (Cie/Compagnie, Ets, St)
+            k = strip_acc(t).lower()
+            if k in ABBR and self.ch(0.3):
+                out[i] = self.r.choice(ABBR[k])
         if self.ch(0.045):
             out.append(self.r.choice(FILL_ADD))
         if len(out) >= 2 and self.ch(0.03):
@@ -232,15 +238,45 @@ class Gen:
                 else:
                     toks[0] = str(n) + m.group(2)
         for _ in range(2):  # v2: French street names are typo'd far more often (real accepted street-differs 6.9%)
-            if len(toks) > 1 and self.ch(0.3):
+            if len(toks) > 1 and self.ch(RATES["st_typo"]):
                 i = self.r.randrange(1, len(toks))
                 toks[i] = self.typo(toks[i])
         return " ".join(toks)
 
 
-def main(seed: int = 7):
+def derive_geo(s1: pl.DataFrame):
+    """Cities, regions and city -> department from the supplied France test records only.
+    Regions: the 3 most frequent digit-free components of France S1 addresses. Cities: the other frequent ones.
+    Departments: frequent digit-free components of France S2/S3 addresses that never occur in S1 addresses;
+    each city gets the department it co-occurs with most often in the same record address."""
+    from collections import Counter
+    comp = lambda a: [c.strip() for c in (a or "").split(",") if c.strip() and not re.search(r"\d", c)]
+    cs1 = Counter(c.lower() for a in s1["business_address"].to_list() for c in comp(a))
+    regions = {c for c, _ in cs1.most_common(3)}
+    cities = {c for c, n in cs1.items() if n >= 100 and c not in regions}
+    rec = pl.concat([pl.read_parquet(C.CACHE / f"test_source{k}.parquet") for k in (2, 3)]).filter(pl.col("country") == "France")
+    crec = Counter(c for a in rec["business_address"].drop_nulls().to_list() for c in comp(a))
+    depts = {c for c, n in crec.items() if n >= 1000 and c.lower() not in cs1}
+    co = Counter()
+    for a in rec["business_address"].drop_nulls().to_list():
+        cc = comp(a)
+        cl = [c.lower() for c in cc if c.lower() in cities]
+        dl = [c for c in cc if c in depts]
+        for x in cl:
+            for d in dl:
+                co[(x, d)] += 1
+    dept = {}
+    for (x, d), n in co.most_common():
+        dept.setdefault(x, d)
+    return dept, regions
+
+
+def main(seed: int = 7, split: str = "synfr"):
+    global DEPT, REGIONS
     rnd = random.Random(seed)
     s1 = pl.read_parquet(C.CACHE / "test_source1.parquet").filter(pl.col("country") == "France")
+    DEPT, REGIONS = derive_geo(s1)
+    print(f"derived geography: regions {sorted(REGIONS)}; city->department {DEPT}")
     cats = json.loads((C.EXP_RUN / "france_category_swap.json").read_text())["test France"]["category_words"]
     # category-word surface forms as they appear in S1 names (accents/case), with frequencies
     surf = {}
@@ -262,7 +298,8 @@ def main(seed: int = 7):
         if city:
             city_addr.setdefault(city.lower(), []).append(a)
     city_streets = {k: [c.strip() for a in v for c in a.split(",") if re.search(r"\d", c)] for k, v in city_addr.items()}
-    gt = pl.read_parquet(C.CACHE / "train_ground_truth.parquet").with_columns(pl.col("matched_entity_ids").fill_null("").str.split(","))
+    trs = pl.read_parquet(C.CACHE / "splits" / "train_s1_split.parquet").filter(pl.col("is_train")).select(pl.col("entity_id").alias("source1_entity_id"))
+    gt = pl.read_parquet(C.CACHE / "train_ground_truth.parquet").join(trs, on="source1_entity_id").with_columns(pl.col("matched_entity_ids").fill_null("").str.split(","))
     counts = [(sum(1 for x in l if x.startswith("S2")), sum(1 for x in l if x.startswith("S3"))) for l in gt["matched_entity_ids"].to_list()]
 
     ents = []  # (entity_id, name, address, kind)
@@ -306,6 +343,7 @@ def main(seed: int = 7):
                 else:
                     mid = f"SF3-{c3}"
                     c3 += 1
+                g.allow_whole = RATES["sib_whole"] or kind != "sibling"
                 addr = g.address(a, src, city_streets)
                 rec = {"entity_id": mid, "business_name": g.name(n, addr is None), "business_address": addr, "country": "France"}
                 (recs2 if src == 2 else recs3).append(rec)
@@ -314,10 +352,10 @@ def main(seed: int = 7):
     s1_out = pl.DataFrame([{"entity_id": e, "business_name": n, "business_address": a, "country": "France"}
                            for i, (e, n, a, k) in enumerate(ents[:n_s1]) if i not in ghost])
     shuf = lambda rs: pl.DataFrame(rs).sample(fraction=1.0, shuffle=True, seed=seed)
-    s1_out.sample(fraction=1.0, shuffle=True, seed=seed).write_parquet(C.CACHE / "synfr_source1.parquet")
-    shuf(recs2).write_parquet(C.CACHE / "synfr_source2.parquet")
-    shuf(recs3).write_parquet(C.CACHE / "synfr_source3.parquet")
-    pl.DataFrame(truth, schema=["s1", "m"], orient="row").write_parquet(C.CACHE / "synfr_truth.parquet")
+    s1_out.sample(fraction=1.0, shuffle=True, seed=seed).write_parquet(C.CACHE / f"{split}_source1.parquet")
+    shuf(recs2).write_parquet(C.CACHE / f"{split}_source2.parquet")
+    shuf(recs3).write_parquet(C.CACHE / f"{split}_source3.parquet")
+    pl.DataFrame(truth, schema=["s1", "m"], orient="row").write_parquet(C.CACHE / f"{split}_truth.parquet")
     kinds = {k: sum(1 for e in ents if e[3] == k) for k in ("s1", "sibling", "namesake", "stranger")}
     print(f"synfr: S1 {s1_out.height:,} (ghosts {len(ghost):,}); entities {kinds}; records S2 {len(recs2):,} S3 {len(recs3):,} "
           f"({(len(recs2) + len(recs3)) / s1_out.height:.2f}/S1); true pairs {len(truth):,}")
@@ -326,4 +364,20 @@ def main(seed: int = 7):
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("--seed", type=int, default=7)
-    main(ap.parse_args().seed)
+    ap.add_argument("--split", default="synfr")
+    ap.add_argument("--sib", type=float)
+    ap.add_argument("--name", type=float)
+    ap.add_argument("--new", type=float)
+    ap.add_argument("--whole", type=float)
+    ap.add_argument("--st-typo", type=float)
+    ap.add_argument("--fill-sub", type=float)
+    ap.add_argument("--no-sib-whole", action="store_true")
+    a = ap.parse_args()
+    if a.sib is not None: SIB_FRAC = a.sib
+    if a.name is not None: NAME_FRAC = a.name
+    if a.new is not None: NEW_FRAC = a.new
+    if a.whole is not None: RATES["whole"] = a.whole
+    if a.st_typo is not None: RATES["st_typo"] = a.st_typo
+    if a.fill_sub is not None: RATES["fill_sub"] = a.fill_sub
+    if a.no_sib_whole: RATES["sib_whole"] = False
+    main(a.seed, a.split)
