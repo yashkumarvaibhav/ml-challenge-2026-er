@@ -139,7 +139,7 @@ def main():
     (C.EXP_RUN / "france_street_diff.json").write_text(json.dumps(rep, indent=1))
 
 
-def write(base: str):
+def write(base: str, only: str = "both"):
     arch = C.ROOT / "submissions" / "archive" / base
     m = pl.read_csv(arch / "matching_results.tsv", separator="\t", quote_char=None, infer_schema_length=0)
     c1, c2 = m.columns
@@ -147,7 +147,8 @@ def write(base: str):
     pairs = (m.with_columns(pl.col(c2).fill_null("").str.split(",")).explode(c2).filter(pl.col(c2) != "").rename({c1: "s1", c2: "m"}))
     fr = pairs.join(t1, on="s1").join(rec, on="m")
     f = flags(fr)
-    drop = f.filter(pl.col("street_diff") | pl.col("swap2")).select("s1", "m")
+    cond = {"both": pl.col("street_diff") | pl.col("swap2"), "street": pl.col("street_diff"), "swap": pl.col("swap2")}[only]
+    drop = f.filter(cond).select("s1", "m")
     kept = pairs.join(drop, on=["s1", "m"], how="anti")
     g = kept.group_by("s1").agg(pl.col("m").sort().str.join(",").alias(c2)).rename({"s1": c1})
     out = m.select(c1).join(g, on=c1, how="left").with_columns(pl.col(c2).fill_null(""))
@@ -160,5 +161,6 @@ def write(base: str):
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("--write")
+    ap.add_argument("--only", choices=["both", "street", "swap"], default="both")
     a = ap.parse_args()
-    write(a.write) if a.write else main()
+    write(a.write, a.only) if a.write else main()
