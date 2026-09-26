@@ -44,5 +44,28 @@ def main():
     (C.EXP_RUN / "ce_veto_confident.json").write_text(json.dumps(rep, indent=1))
 
 
+def write(base: str, thr: float = 0.02):
+    """output/ = archived `base` minus its France pairs whose standard-CE score < thr (removal only)."""
+    import shutil
+    arch = C.ROOT / "submissions" / "archive" / base
+    m = pl.read_csv(arch / "matching_results.tsv", separator="\t", quote_char=None, infer_schema_length=0)
+    c1, c2 = m.columns
+    drop = pl.read_parquet(S2 / "ce_france_accepted_e5base2.parquet").filter(pl.col("ce") < thr).select("s1", "m")
+    pairs = (m.with_columns(pl.col(c2).fill_null("").str.split(",")).explode(c2).filter(pl.col(c2) != "")
+             .rename({c1: "s1", c2: "m"}))
+    kept = pairs.join(drop, on=["s1", "m"], how="anti")
+    g = kept.group_by("s1").agg(pl.col("m").sort().str.join(",").alias(c2)).rename({"s1": c1})
+    out = m.select(c1).join(g, on=c1, how="left").with_columns(pl.col(c2).fill_null(""))
+    assert out[c1].to_list() == m[c1].to_list()
+    out.write_csv(C.OUTPUT / "matching_results.tsv", separator="\t", quote_style="never")
+    shutil.copyfile(arch / "candidate_pairs.tsv", C.OUTPUT / "candidate_pairs.tsv")
+    print(f"removed {pairs.height - kept.height:,} France pairs with CE < {thr} from {base}")
+
+
 if __name__ == "__main__":
-    main()
+    import argparse
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--write")
+    ap.add_argument("--thr", type=float, default=0.02)
+    a = ap.parse_args()
+    write(a.write, a.thr) if a.write else main()
