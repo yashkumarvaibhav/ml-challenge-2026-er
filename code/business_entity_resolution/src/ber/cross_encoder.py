@@ -238,6 +238,37 @@ def bench(n_train_batches: int = 30, n_score: int = 50_000):
     step("ce", "bench: " + json.dumps(rep))
 
 
+def evalband_v6():
+    """Reviewer 09:54 UTC: this CE vs e5-base on the SAME fixed v6 world-20 holdout band (pairs and e5-base scores from
+    cache/v6/s2/ce_w20_e5base.parquet); AUC / log loss overall, per holdout half, and for address-null records."""
+    from sklearn.metrics import log_loss, roc_auc_score
+    sp = pl.read_parquet(C.CACHE / "splits" / "train_s1_split.parquet")
+    hold = sp.filter(pl.col("is_holdout") & ~pl.col("is_ghost")).select(pl.col("entity_id").alias("s1"), "holdout_half")
+    b = pl.read_parquet(C.CACHE / "v6" / "s2" / "ce_w20_e5base.parquet").join(hold, on="s1").rename({"ce": "ce_base"})
+    f = pl.read_parquet(C.CACHE / "v6" / "s2" / "s2feats_w20_e5base.parquet", columns=["s1", "m", "m_a_null", "p1"])
+    truth = load_train_pairs().select("s1", "m").with_columns(pl.lit(1).alias("y"))
+    b = b.join(f, on=["s1", "m"], how="left").join(truth, on=["s1", "m"], how="left").with_columns(pl.col("y").fill_null(0))
+    b = b.with_columns(pl.Series("ce_new", score(b.select("s1", "m"), "train", name=f"ce score v6 band ({CE_NAME})")))
+    rep = {"pairs": b.height, "pos_rate": round(float(b["y"].mean()), 4)}
+
+    def m(x, tag):
+        y = x["y"].to_numpy()
+        if y.min() == y.max():
+            return
+        for c in ("ce_base", "ce_new", "p1"):
+            v = x[c].to_numpy()
+            rep[f"{tag} auc_{c}"] = round(float(roc_auc_score(y, v)), 4)
+            if c != "p1":
+                rep[f"{tag} logloss_{c}"] = round(float(log_loss(y, np.clip(v, 1e-6, 1 - 1e-6))), 4)
+
+    m(b, "all")
+    m(b.filter(pl.col("m_a_null") == 1), "addr_null")
+    for h in ("A", "B"):
+        m(b.filter(pl.col("holdout_half") == h), f"half{h}")
+    (C.EXPERIMENTS / f"ce_evalband_v6{SUFFIX}.json").write_text(json.dumps(rep, indent=2))
+    step("ce", "evalband_v6: " + json.dumps(rep))
+
+
 def evalband():
     """Holdout uncertain-band check: CE vs stage-1 (v4) on pairs with v4 p in BAND."""
     from sklearn.metrics import log_loss, roc_auc_score
@@ -262,5 +293,5 @@ if __name__ == "__main__":
     t0 = time.time()
     for s in a.steps.split(","):
         step("ce", f"step {s} ...")
-        {"data": data, "train": train, "evalband": evalband, "bench": bench}[s]()
+        {"data": data, "train": train, "evalband": evalband, "evalband_v6": evalband_v6, "bench": bench}[s]()
     step("ce", f"steps {a.steps} DONE in {time.time() - t0:.0f}s")
