@@ -18,6 +18,7 @@ Extra features (computed only for pairs with p1 >= P_MIN; others 0):
 """
 import argparse
 import json
+import os
 import re
 import unicodedata
 
@@ -32,7 +33,8 @@ from .model import PARAMS, decide
 from .progress import step
 from .stage2 import CE_FEATURES, MODEL_S2, S2, S2_FEATURES, SFX, _a_null, _with_ce, s2_features
 
-OUT = C.WORK / "synfr"
+SYN = os.environ.get("BER_SYN", "synfr")
+OUT = C.WORK / SYN
 P_MIN = 0.005
 LEG = set("inc llc ltd pvt private limited corp co corporation company pc pllc llp lp sarl sas sa sasu eurl ei snc sci s a r l".split())
 FILL = {"services", "service", "france", "fils", "associes", "developpement", "groupe", "international", "participations",
@@ -107,8 +109,8 @@ def add_france_feats(d: pl.DataFrame, split: str) -> pl.DataFrame:
 def feats_syn():
     st = pl.read_parquet(OUT / "stage1.parquet").rename({"p": "p1"})
     cand = pl.read_parquet(OUT / "cand.parquet")
-    d = _with_ce(s2_features(st, cand, _a_null("synfr")), OUT / "ce_band_e5base2.parquet")
-    add_france_feats(d, "synfr").write_parquet(OUT / "s2feats_fr.parquet")
+    d = _with_ce(s2_features(st, cand, _a_null(SYN)), OUT / "ce_band_e5base2.parquet")
+    add_france_feats(d, SYN).write_parquet(OUT / "s2feats_fr.parquet")
 
 
 def _halves():
@@ -135,6 +137,31 @@ def fit():
     b.save_model(str(MODEL_FR), num_iteration=b.best_iteration)
     imp = sorted(zip(b.feature_name(), b.feature_importance("gain")), key=lambda x: -x[1])
     step("france_s2", f"fit: {trn.height:,} rows, best iteration {b.best_iteration}; top {[(n, round(g)) for n, g in imp[:10]]}")
+
+
+def eval_cross():
+    """Stress test (reviewer 16:45): a France model fitted on simulator `synfr` scored on ANOTHER simulator (BER_SYN),
+    all of its S1s, against the unchanged pipeline + category rule on the same simulator."""
+    from .experiments.france_category_swap import classify
+    d = pl.read_parquet(OUT / "s2feats_fr.parquet")
+    truth = pl.read_parquet(C.CACHE / f"{SYN}_truth.parquet")
+    s1 = pl.read_parquet(C.CACHE / f"{SYN}_source1.parquet", columns=["entity_id"]).rename({"entity_id": "s1"}).with_columns(pl.lit("France").alias("country"))
+    fr = lgb.Booster(model_file=str(MODEL_FR))
+    new = d.select("s1", "m").with_columns(pl.Series("p", fr.predict(d.select(fr.feature_name()).to_numpy())))
+    cats = _cats()
+    n1 = pl.read_parquet(C.CACHE / f"{SYN}_source1.parquet", columns=["entity_id", "business_name"]).rename({"entity_id": "s1", "business_name": "n1"})
+    n2 = pl.concat([pl.read_parquet(C.CACHE / f"{SYN}_source{k}.parquet", columns=["entity_id", "business_name"]) for k in (2, 3)]).rename({"entity_id": "m", "business_name": "n2"})
+    bd = decide(pl.read_parquet(OUT / "pred_s2.parquet"), 0.4, 0.75).join(n1, on="s1").join(n2, on="m")
+    sw = pl.Series([bool((c := classify(a, b)) and c[0] and c[1] in cats) for a, b in zip(bd["n1"], bd["n2"])])
+    b8 = bd.filter(~sw).select("s1", "m")
+    f = lambda x: round(per_s1_f05(x, truth, s1)["f05"].mean(), 5)
+    rep = {"baseline": f(bd.select("s1", "m")), "baseline + category rule (#8 analog)": f(b8),
+           "France model 0.5/0.7": f(decide(new, 0.5, 0.7)), "France model 0.4/0.75": f(decide(new, 0.4, 0.75))}
+    x = b8.join(new, on=["s1", "m"])
+    for t in (0.1, 0.3, 0.5):
+        rep[f"#8 analog, remove if France-model p<{t}"] = f(x.filter(pl.col("p") >= t).select("s1", "m"))
+    (C.EXP_RUN / f"france_s2_cross_{SYN}.json").write_text(json.dumps(rep, indent=1))
+    step("france_s2", f"cross-simulator eval on {SYN}: {rep}")
 
 
 def eval_syn():
@@ -190,7 +217,7 @@ if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("--steps", required=True)
     a = ap.parse_args()
-    fns = {"feats_syn": feats_syn, "fit": fit, "eval_syn": eval_syn, "feats_test": feats_test, "apply": apply}
+    fns = {"feats_syn": feats_syn, "fit": fit, "eval_syn": eval_syn, "eval_cross": eval_cross, "feats_test": feats_test, "apply": apply}
     for s in a.steps.split(","):
         step("france_s2", f"step {s} ...")
         fns[s]()

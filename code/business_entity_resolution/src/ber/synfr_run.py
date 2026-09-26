@@ -11,6 +11,7 @@ Steps (resumable; artifacts under cache/v6/synfr/):
 """
 import argparse
 import json
+import os
 import shutil
 
 import lightgbm as lgb
@@ -20,8 +21,8 @@ import polars as pl
 from . import config as C
 from .progress import step
 
-SPLIT = "synfr"
-OUT = C.WORK / "synfr"
+SPLIT = os.environ.get("BER_SYN", "synfr")  # synthetic split name (stress test: a second simulator)
+OUT = C.WORK / SPLIT
 
 
 def norm():
@@ -138,7 +139,7 @@ def evaluate():
                      "precision": round(tp / d2.height, 4), "recall": round(tp / truth.height, 4)}
         step("synfr", f"eval {name}: {rep[name]}")
     rep["oracle"] = rep.pop("oracle_pair_recall")
-    (C.EXP_RUN / "synfr_eval.json").write_text(json.dumps(rep, indent=1))
+    (C.EXP_RUN / f"{SPLIT}_eval.json").write_text(json.dumps(rep, indent=1))
     print(json.dumps(rep, indent=1))
 
 
