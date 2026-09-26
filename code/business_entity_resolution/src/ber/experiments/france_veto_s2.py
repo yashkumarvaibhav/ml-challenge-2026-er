@@ -94,7 +94,8 @@ def write2(base: str, t_add_fr: float, relaxed: bool):
     b = decide(pl.read_parquet(S2 / f"test_pred{SFX}_frveto.parquet").join(fr.select("s1"), on="s1"), TA, t_add_fr)
     if relaxed:
         acc = b.join(fr, on="s1").join(rec, on="m")
-        cats = category_words(acc, fr["n1"].to_list())
+        # category words from the PRE-veto accepted pairs (after the veto, swaps are rare and the counts vanish)
+        cats = set(json.loads((C.EXP_RUN / "france_category_swap.json").read_text())["test France"]["category_words"])
         sub, add = collections.Counter(), collections.Counter()
         for n1, n2 in zip(acc["n1"], acc["n2"]):
             c = classify(n1, n2)
