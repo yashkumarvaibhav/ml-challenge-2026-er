@@ -285,6 +285,10 @@ def evaluate(w: int = 20):
                 best = (f, ta, tb)
     rep["final_params"] = {"t_any": best[1], "t_add": best[2], "holdout_f05": best[0]}
     (C.EXP_RUN / f"s2_eval_w{w}{SFX}.json").write_text(json.dumps(rep, indent=2))
+    if w == 20:  # decision file for `ber.pipeline test --steps write` (BER_DECISION)
+        (C.EXP_RUN / f"decision_params_s2{SFX}.json").write_text(json.dumps(
+            {"t_any": best[1], "t_add": best[2], "holdout_f05_w20": best[0],
+             "source": f"{(C.EXP_RUN / f's2_eval_w{w}{SFX}.json').relative_to(C.ROOT)}"}, indent=2))
     s2.write_parquet(S2 / f"holdout_pred_w{w}{SFX}.parquet")
     step("stage2", "eval w%d: stage2 %s | stage1 same universe %s | final %s" % (
         w, {k: v["report"]["macro_f05"] for k, v in rep["stage2"].items()},

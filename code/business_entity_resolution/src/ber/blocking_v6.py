@@ -1,7 +1,7 @@
 """v6 candidate generation: learned dense retrieval + exact keys (plan-discussion 2026-09-25 16:44 / 16:50 UTC).
 
 Per country:
-  (df) dense forward   S1 -> top KF S2/S3 records by bi-encoder cosine (faiss IVF, `ber.dense`)
+  (df) dense forward   S1 -> top KF S2/S3 records by bi-encoder cosine (GPU IVF index, `ber.ann` via `ber.dense`)
   (dr) dense reverse   S2/S3 record -> top KR S1s (address-less / heavily noised records)
   (h)  exact core name + address number key       (as in v4 blocking; keys shared by <= 50 records)
   (j)  exact full name + address number key       (as in v4 blocking)
