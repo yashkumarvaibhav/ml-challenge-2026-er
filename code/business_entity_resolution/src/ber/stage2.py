@@ -58,7 +58,13 @@ SFX = "" if os.environ.get("BER_CE", "e5small") == "e5small" else "_" + os.envir
 # stage 2 sees the name/address evidence behind p1 (e.g. address-null noisy-name extras). Competition features, CE
 # scores and S1 partitions are unchanged; its model, reports and predictions get the extra suffix "_x".
 XF = os.environ.get("BER_S2X") == "1"
-MSFX = SFX + ("_x" if XF else "")
+# per-source count features (BER_S2SRC=1; 26 Sep): the generator gives almost every entity records in BOTH sources
+# (train: n2 = 0 for 13%, n3 = 0 for 12% of entities), so an S1 that already holds strong records of one source but
+# none of the other is the likelier owner of an ambiguous record from the missing source (address-null namesakes).
+SRCF = os.environ.get("BER_S2SRC") == "1"
+FSFX = "_src" if SRCF else ""
+SRC_FEATURES = ["s_n_hi_src", "s_n_hi_oth", "s_sum_src", "s_top_src", "m_rank_src_rival"]
+MSFX = SFX + ("_x" if XF else "") + FSFX
 MODEL_S2 = C.ROOT / "models" / (("lgb_s2_v6" if C.V6 else "lgb_s2") + MSFX + ".txt")
 
 
@@ -242,6 +248,19 @@ def s2_features(stage1: pl.DataFrame, cand: pl.DataFrame, a_null: pl.DataFrame) 
         pl.when(pl.col("m_rank") == 1).then(pl.col("_m_second").fill_null(0.0)).otherwise(pl.col("_m_max")).alias("m_best_other"))
     d = d.with_columns((p - pl.col("m_best_other")).alias("m_gap"), (pl.col("s_top") - p).alias("s_gap_top"),
                        pl.col("m_a_null").cast(pl.Float32)).drop("_m_max", "_m_second")
+    if SRCF:
+        hi = (p >= 0.5).cast(pl.Float32)
+        src = pl.col("m").str.slice(0, 2)
+        d = d.with_columns(src.alias("_src"))
+        d = d.with_columns(
+            ((p >= 0.5).cast(pl.Float32).sum().over(["s1", "_src"]) - hi).alias("s_n_hi_src"),     # same-source strong records, excl. this
+            ((p >= 0.5).cast(pl.Float32).sum().over("s1") - (p >= 0.5).cast(pl.Float32).sum().over(["s1", "_src"])).alias("s_n_hi_oth"),
+            (p.sum().over(["s1", "_src"]) - p).alias("s_sum_src"),
+            p.max().over(["s1", "_src"]).alias("s_top_src"),
+        )
+        # among S1s competing for this record: rank of this S1 by how few same-source strong records it already holds
+        d = d.with_columns(pl.col("s_n_hi_src").rank("min").over("m").cast(pl.Float32).alias("m_rank_src_rival")).drop("_src")
+        return d.with_columns([pl.col(c).cast(pl.Float32) for c in S2_FEATURES + SRC_FEATURES])
     return d.with_columns([pl.col(c).cast(pl.Float32) for c in S2_FEATURES])
 
 
@@ -255,15 +274,15 @@ def s2feats(w: int):
     _assert_coverage(st, w)
     cand = pl.read_parquet(C.WORK / "cand" / f"train_full_w{w}.parquet")
     step("stage2", f"competition features over {st.height:,} pairs ...")
-    _with_ce(s2_features(st, cand, _a_null("train")), S2 / f"ce_w{w}{SFX}.parquet").write_parquet(S2 / f"s2feats_w{w}{SFX}.parquet")
+    _with_ce(s2_features(st, cand, _a_null("train")), S2 / f"ce_w{w}{SFX}.parquet").write_parquet(S2 / f"s2feats_w{w}{SFX}{FSFX}.parquet")
 
 
 def _feat_list(d: pl.DataFrame):
-    return S2_FEATURES + [c for c in CE_FEATURES if c in d.columns and d[c].null_count() < d.height]
+    return S2_FEATURES + (SRC_FEATURES if SRCF else []) + [c for c in CE_FEATURES if c in d.columns and d[c].null_count() < d.height]
 
 
 def fit(w: int = 20):
-    d = pl.read_parquet(S2 / f"s2feats_w{w}{SFX}.parquet")
+    d = pl.read_parquet(S2 / f"s2feats_w{w}{SFX}{FSFX}.parquet")
     FEATS = _feat_list(d)
     step("stage2", f"fit features: {len(FEATS)} ({'with' if 'ce' in FEATS else 'without'} cross-encoder)")
     truth = load_train_pairs().select("s1", "m").with_columns(pl.lit(1, pl.Int8).alias("y"))
@@ -289,7 +308,7 @@ def fit(w: int = 20):
 
 
 def evaluate(w: int = 20):
-    d = pl.read_parquet(S2 / f"s2feats_w{w}{SFX}.parquet")
+    d = pl.read_parquet(S2 / f"s2feats_w{w}{SFX}{FSFX}.parquet")
     sp = _split()
     hold = sp.filter(pl.col("is_holdout") & ~pl.col("is_ghost")).select(pl.col("entity_id").alias("s1"), "country", "holdout_half")
     d = d.join(hold.select("s1"), on="s1")
