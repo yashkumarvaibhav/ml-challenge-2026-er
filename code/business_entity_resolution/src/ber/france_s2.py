@@ -40,7 +40,7 @@ LEG = set("inc llc ltd pvt private limited corp co corporation company pc pllc l
 FILL = {"services", "service", "france", "fils", "associes", "developpement", "groupe", "international", "participations",
         "distribution", "holding", "cie", "et", "enterprises", "trading"}
 FEATS_FR = ["f_swap", "f_cat_new", "f_cat_drop", "f_fill_sub", "f_sib_s1", "f_sib_m"]
-MODEL_FR = C.ROOT / "models" / f"lgb_s2_v6{SFX}_france.txt"
+MODEL_FR = C.ROOT / "models" / f"lgb_s2_v6{SFX}_france{os.environ.get('BER_FR_MODEL', '')}.txt"  # BER_FR_MODEL: variant suffix
 
 
 def _cats():
@@ -114,7 +114,7 @@ def feats_syn():
 
 
 def _halves():
-    s1 = pl.read_parquet(C.CACHE / "synfr_source1.parquet", columns=["entity_id"]).rename({"entity_id": "s1"})
+    s1 = pl.read_parquet(C.CACHE / f"{SYN}_source1.parquet", columns=["entity_id"]).rename({"entity_id": "s1"})
     return s1.with_columns(pl.when((pl.col("s1").hash(seed=5) % 2) == 0).then(pl.lit("A")).otherwise(pl.lit("B")).alias("half"))
 
 
@@ -124,7 +124,7 @@ def _feat_names(d):
 
 def fit():
     d = pl.read_parquet(OUT / "s2feats_fr.parquet")
-    truth = pl.read_parquet(C.CACHE / "synfr_truth.parquet").with_columns(pl.lit(1, pl.Int8).alias("y"))
+    truth = pl.read_parquet(C.CACHE / f"{SYN}_truth.parquet").with_columns(pl.lit(1, pl.Int8).alias("y"))
     h = _halves()
     d = d.join(h.filter(pl.col("half") == "A").select("s1"), on="s1").join(truth, on=["s1", "m"], how="left").with_columns(pl.col("y").fill_null(0))
     F = _feat_names(d)
