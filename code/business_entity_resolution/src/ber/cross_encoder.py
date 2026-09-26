@@ -32,19 +32,23 @@ BASES = {"e5small": ("intfloat/multilingual-e5-small", "614241f622f53c4eeff9890b
          "e5large": ("intfloat/multilingual-e5-large", "3d7cfbdacd47fdda877c5cd8a79fbcc4f2a574f3"),     # MIT, ~560M
          "bgerr": ("BAAI/bge-reranker-v2-m3", "953dc6f6f85a1b2dbfca4c34a2796e7dde08d41e"),          # Apache-2.0, ~568M
          # e5-base CE continued on v6-candidate hard negatives (warm start from models/ce_e5base; same base model)
-         "e5base2": ("intfloat/multilingual-e5-base", "d128750597153bb5987e10b1c3493a34e5a4502a")}
+         "e5base2": ("intfloat/multilingual-e5-base", "d128750597153bb5987e10b1c3493a34e5a4502a"),
+         # e5base2 continued on France self-training pairs (confident positives, one-S1-rule-safe negatives) + US/India mix
+         "e5base2fr": ("intfloat/multilingual-e5-base", "d128750597153bb5987e10b1c3493a34e5a4502a")}
 # a model pre-trained AS a cross-encoder keeps its own sequence-classification head (reviewer 18:10 UTC);
 # plain encoders get mean pooling + a new linear head
 SEQCLS = CE_NAME == "bgerr"
 N_PAIRS = int(os.environ.get("BER_CE_NPAIRS", "0"))  # 0 = all CE training pairs; >0 = bounded pilot fit
 # e5base2: hard negatives from the v6 candidate set (dense retrieval) and a warm start from the e5-base CE
 V6NEG = CE_NAME == "e5base2"
-INIT = C.ROOT / "models" / "ce_e5base" / "model.pt" if V6NEG else None
+INIT = {"e5base2": C.ROOT / "models" / "ce_e5base" / "model.pt",
+        "e5base2fr": C.ROOT / "models" / "ce_e5base2" / "model.pt"}.get(CE_NAME)
 BASE = C.ROOT / "models" / "hf" / BASES[CE_NAME][0].split("/")[1]
 OUT = C.ROOT / "models" / f"ce_{CE_NAME}"
 SUFFIX = "" if CE_NAME == "e5small" else f"_{CE_NAME}"  # cache/report names of non-default CEs
 DATA = C.CACHE / "ce"
-PAIRS = DATA / f"train_pairs{'' if CE_NAME in ('e5small', 'e5base', 'bgerr', 'e5large') else '_' + CE_NAME}.parquet"
+PAIRS = DATA / ("train_pairs_frst.parquet" if CE_NAME == "e5base2fr" else
+                f"train_pairs{'' if CE_NAME in ('e5small', 'e5base', 'bgerr', 'e5large') else '_' + CE_NAME}.parquet")
 MAX_LEN, LR, NEG_PER_POS = 128, 3e-5, 2
 BATCH = int(os.environ.get("BER_CE_BATCH", "256"))
 BAND = (0.01, 0.995)
