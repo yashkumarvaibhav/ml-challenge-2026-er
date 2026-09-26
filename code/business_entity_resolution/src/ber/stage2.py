@@ -54,7 +54,24 @@ CE_FEATURES = ["ce", "ce_minus_p1"]
 MODEL_V4 = C.ROOT / "models" / ("lgb_v6.txt" if C.V6 else "lgb_v4.txt")  # the stage-1 model of this run
 # CE variant (BER_CE, see ber.cross_encoder): non-default CEs get their own score files, stage-2 model and reports
 SFX = "" if os.environ.get("BER_CE", "e5small") == "e5small" else "_" + os.environ["BER_CE"]
-MODEL_S2 = C.ROOT / "models" / (("lgb_s2_v6" if C.V6 else "lgb_s2") + SFX + ".txt")
+# stage-2 challenger (reviewer 2026-09-26 12:59 UTC; BER_S2X=1): also feed the direct stage-1 pair features, so
+# stage 2 sees the name/address evidence behind p1 (e.g. address-null noisy-name extras). Competition features, CE
+# scores and S1 partitions are unchanged; its model, reports and predictions get the extra suffix "_x".
+XF = os.environ.get("BER_S2X") == "1"
+MSFX = SFX + ("_x" if XF else "")
+MODEL_S2 = C.ROOT / "models" / (("lgb_s2_v6" if C.V6 else "lgb_s2") + MSFX + ".txt")
+
+
+PAIR_X = [f for f in FEATURES if f not in S2_FEATURES and f not in BLK]
+
+
+def _with_pair(d: pl.DataFrame, feat_dir) -> pl.DataFrame:
+    """Join the direct pair features (PAIR_X) for the S1s in d, part by part (bounded memory)."""
+    s1 = d.select("s1").unique()
+    x = pl.concat([pl.read_parquet(p, columns=["s1", "m"] + PAIR_X).join(s1, on="s1") for p in sorted(feat_dir.glob("part*.parquet"))])
+    out = d.join(x, on=["s1", "m"], how="left")
+    assert out.height == d.height and out[PAIR_X[0]].null_count() == 0, "pair features missing for some stage-2 rows"
+    return out
 
 
 def _split():
@@ -254,6 +271,10 @@ def fit(w: int = 20):
     if C.V6:  # reviewer 17:13 UTC: stage-2 fit S1s never trained the bi-encoder
         assert tr_s1.join(_bienc(), on="s1").height == 0, "stage-2 fit sample overlaps bi-encoder S1s"
     d = d.join(tr_s1, on="s1").join(truth, on=["s1", "m"], how="left").with_columns(pl.col("y").fill_null(0))
+    if XF:
+        d = _with_pair(d, S2 / f"feats_w{w}")
+        FEATS = FEATS + PAIR_X
+        step("stage2", f"fit: + {len(PAIR_X)} direct pair features -> {len(FEATS)}")
     es_s1 = d.select("s1").unique().sort("s1").sample(fraction=0.1, seed=C.SEED)
     es, trn = d.join(es_s1, on="s1"), d.join(es_s1, on="s1", how="anti")
     step("stage2", f"fit: {trn.height:,} rows (pos {int(trn['y'].sum()):,}), early-stop {es.height:,}")
@@ -264,7 +285,7 @@ def fit(w: int = 20):
     step("stage2", f"fit: best iteration {booster.best_iteration}")
     booster.save_model(str(MODEL_S2), num_iteration=booster.best_iteration)
     imp = sorted(zip(booster.feature_name(), booster.feature_importance("gain")), key=lambda x: -x[1])
-    (C.EXP_RUN / f"s2_importance{SFX}.json").write_text(json.dumps([(n, round(g, 1)) for n, g in imp], indent=1))
+    (C.EXP_RUN / f"s2_importance{MSFX}.json").write_text(json.dumps([(n, round(g, 1)) for n, g in imp], indent=1))
 
 
 def evaluate(w: int = 20):
@@ -272,6 +293,8 @@ def evaluate(w: int = 20):
     sp = _split()
     hold = sp.filter(pl.col("is_holdout") & ~pl.col("is_ghost")).select(pl.col("entity_id").alias("s1"), "country", "holdout_half")
     d = d.join(hold.select("s1"), on="s1")
+    if XF:
+        d = _with_pair(d, S2 / f"feats_w{w}")
     truth = load_train_pairs().select("s1", "m")
     booster = lgb.Booster(model_file=str(MODEL_S2))
     s2 = d.select("s1", "m").with_columns(pl.Series("p", booster.predict(d.select(booster.feature_name()).to_numpy())))
@@ -284,15 +307,30 @@ def evaluate(w: int = 20):
             if best is None or f > best[0]:
                 best = (f, ta, tb)
     rep["final_params"] = {"t_any": best[1], "t_add": best[2], "holdout_f05": best[0]}
-    (C.EXP_RUN / f"s2_eval_w{w}{SFX}.json").write_text(json.dumps(rep, indent=2))
+    (C.EXP_RUN / f"s2_eval_w{w}{MSFX}.json").write_text(json.dumps(rep, indent=2))
     if w == 20:  # decision file for `ber.pipeline test --steps write` (BER_DECISION)
-        (C.EXP_RUN / f"decision_params_s2{SFX}.json").write_text(json.dumps(
+        (C.EXP_RUN / f"decision_params_s2{MSFX}.json").write_text(json.dumps(
             {"t_any": best[1], "t_add": best[2], "holdout_f05_w20": best[0],
-             "source": f"{(C.EXP_RUN / f's2_eval_w{w}{SFX}.json').relative_to(C.ROOT)}"}, indent=2))
-    s2.write_parquet(S2 / f"holdout_pred_w{w}{SFX}.parquet")
+             "source": f"{(C.EXP_RUN / f's2_eval_w{w}{MSFX}.json').relative_to(C.ROOT)}"}, indent=2))
+    s2.write_parquet(S2 / f"holdout_pred_w{w}{MSFX}.parquet")
     step("stage2", "eval w%d: stage2 %s | stage1 same universe %s | final %s" % (
         w, {k: v["report"]["macro_f05"] for k, v in rep["stage2"].items()},
         {k: v["report"]["macro_f05"] for k, v in rep["stage1_same_universe"].items()}, rep["final_params"]))
+
+
+def testfeats(parts: int = 4):
+    """Stage-1 pair features for the test universe, kept for the BER_S2X challenger (ber.pipeline test_score discards them)."""
+    cand = pl.read_parquet(C.WORK / "cand" / "test.parquet")
+    world = pl.read_parquet(C.CACHE / "test_source1.parquet", columns=["entity_id"])
+    out = S2 / "feats_test"
+    out.mkdir(parents=True, exist_ok=True)
+    cand = cand.with_columns((pl.col("s1").hash(seed=0) % parts).alias("_part"))
+    for k in range(parts):
+        path = out / f"part{k}.parquet"
+        if path.exists():
+            continue
+        ck = cand.filter(pl.col("_part") == k).drop("_part")
+        build_features("test", ck, world, name=f"stage2 test features part {k + 1}/{parts}").select(["s1", "m"] + PAIR_X).write_parquet(path)
 
 
 def test():
@@ -300,8 +338,17 @@ def test():
     cand = pl.read_parquet(C.WORK / "cand" / "test.parquet")
     d = _with_ce(s2_features(st, cand, _a_null("test")), S2 / f"ce_test{SFX}.parquet")
     booster = lgb.Booster(model_file=str(MODEL_S2))
-    out = d.select("s1", "m").with_columns(pl.Series("p", booster.predict(d.select(booster.feature_name()).to_numpy())))
-    out.write_parquet(S2 / f"test_pred{SFX}.parquet")
+    if XF:  # predict per test-feature part (bounded memory)
+        outs = []
+        for p in sorted((S2 / "feats_test").glob("part*.parquet")):
+            x = pl.read_parquet(p, columns=["s1", "m"] + PAIR_X)
+            dk = d.join(x.select("s1").unique(), on="s1").join(x, on=["s1", "m"], how="left")
+            outs.append(dk.select("s1", "m").with_columns(pl.Series("p", booster.predict(dk.select(booster.feature_name()).to_numpy()))))
+        out = pl.concat(outs)
+        assert out.height == d.height, "test pair features do not cover the stage-2 universe"
+    else:
+        out = d.select("s1", "m").with_columns(pl.Series("p", booster.predict(d.select(booster.feature_name()).to_numpy())))
+    out.write_parquet(S2 / f"test_pred{MSFX}.parquet")
     step("stage2", f"test: stage-2 scores for {out.height:,} pairs")
 
 
@@ -313,7 +360,7 @@ if __name__ == "__main__":
     S2.mkdir(parents=True, exist_ok=True)
     t0 = time.time()
     fns = {"feats": feats, "oof": oof, "fill": fill, "ce": ce_train_universe, "s2feats": s2feats, "fit": fit, "eval": evaluate,
-           "cetest": lambda w: ce_test(), "test": lambda w: test()}
+           "cetest": lambda w: ce_test(), "testfeats": lambda w: testfeats(), "test": lambda w: test()}
     for s in a.steps.split(","):
         step("stage2", f"step {s} (world{a.world}) ...")
         fns[s](a.world)
