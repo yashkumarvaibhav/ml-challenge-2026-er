@@ -209,7 +209,7 @@ def feats_test():
 def apply():
     d = pl.read_parquet(S2 / "s2feats_test_france_fr.parquet")
     fr = lgb.Booster(model_file=str(MODEL_FR))
-    d.select("s1", "m").with_columns(pl.Series("p", fr.predict(d.select(fr.feature_name()).to_numpy()))).write_parquet(S2 / f"test_pred{SFX}_france_model.parquet")
+    d.select("s1", "m").with_columns(pl.Series("p", fr.predict(d.select(fr.feature_name()).to_numpy()))).write_parquet(S2 / f"test_pred{SFX}_france_model{os.environ.get('BER_FR_MODEL', '')}.parquet")
     step("france_s2", f"applied France model to {d.height:,} real France pairs")
 
 
@@ -227,7 +227,7 @@ def write(base: str, t_any: float = 0.5, t_add: float = 0.7):
     rec = pl.concat([pl.read_parquet(C.CACHE / f"test_source{k}.parquet") for k in (2, 3)]).select(
         pl.col("entity_id").alias("m"), pl.col("business_name").alias("n2"), pl.col("business_address").alias("a2"))
     cats = _cats()
-    d = decide(pl.read_parquet(S2 / f"test_pred{SFX}_france_model.parquet"), t_any, t_add).join(t1, on="s1").join(rec, on="m")
+    d = decide(pl.read_parquet(S2 / f"test_pred{SFX}_france_model{os.environ.get('BER_FR_MODEL', '')}.parquet"), t_any, t_add).join(t1, on="s1").join(rec, on="m")
     keep = pl.Series([not street_diff(a, b) and not ((c := classify(x, y)) and c[0] and c[1] in cats)
                       for a, b, x, y in zip(d["a1"], d["a2"], d["n1"], d["n2"])])
     d = d.filter(keep).select("s1", "m")
