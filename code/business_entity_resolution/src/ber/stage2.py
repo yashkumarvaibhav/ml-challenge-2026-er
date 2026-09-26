@@ -51,6 +51,11 @@ S2_FEATURES = ["p1", "lp1", "m_best_other", "m_gap", "m_rank", "m_n_hi", "m_n_ca
 # multilingual cross-encoder score, only for the stage-1 uncertain band (missing elsewhere, as on test)
 CE_BAND = (0.01, 0.995)
 CE_FEATURES = ["ce", "ce_minus_p1"]
+# Cascade (organizer FAQ 26 Sep: "a pruned later stage is fine"): the stage-1 LightGBM acts as a pre-filter; only
+# pairs with p1 >= PRUNE_P1 are fed to the stage-2 matcher and written to candidate_pairs.tsv (4.73 per S1 on test
+# vs 24.8 from blocking). Every accepted pair of every package has p1 >= 0.01 (the CE band's lower edge), so the
+# matching output is unchanged. Stage-2 context features still use the stage-1 scores of the whole blocked set.
+PRUNE_P1 = CE_BAND[0]
 MODEL_V4 = C.ROOT / "models" / ("lgb_v6.txt" if C.V6 else "lgb_v4.txt")  # the stage-1 model of this run
 # CE variant (BER_CE, see ber.cross_encoder): non-default CEs get their own score files, stage-2 model and reports
 SFX = "" if os.environ.get("BER_CE", "e5small") == "e5small" else "_" + os.environ["BER_CE"]
@@ -356,6 +361,7 @@ def test():
     st = pl.read_parquet(C.WORK / "pred" / "test.parquet").rename({"p": "p1"})
     cand = pl.read_parquet(C.WORK / "cand" / "test.parquet")
     d = _with_ce(s2_features(st, cand, _a_null("test")), S2 / f"ce_test{SFX}.parquet")
+    d = d.filter(pl.col("p1") >= PRUNE_P1)  # the matcher is fed the pre-filtered pairs only
     booster = lgb.Booster(model_file=str(MODEL_S2))
     if XF:  # predict per test-feature part (bounded memory)
         outs = []

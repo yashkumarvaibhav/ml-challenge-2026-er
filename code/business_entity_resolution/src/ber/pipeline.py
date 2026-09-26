@@ -118,8 +118,11 @@ def test_score(parts: int = 4):
 
 def test_write():
     params = json.loads(DECISION.read_text())
-    scored = pl.read_parquet(TEST_PRED)
-    cand = pl.read_parquet(C.WORK / "cand" / "test.parquet").select("s1", "m")
+    from .stage2 import PRUNE_P1
+    # candidate_pairs.tsv = the stage-1 pre-filtered set fed to the stage-2 matcher (see ber.stage2.PRUNE_P1)
+    cand = (pl.read_parquet(C.WORK / "cand" / "test.parquet").select("s1", "m")
+            .join(pl.read_parquet(C.WORK / "pred" / "test.parquet").filter(pl.col("p") >= PRUNE_P1).select("s1", "m"), on=["s1", "m"]))
+    scored = pl.read_parquet(TEST_PRED).join(cand, on=["s1", "m"])
     s1 = load_source("test", 1).select(pl.col("entity_id").alias("s1"))
     pred = decide(scored, params["t_any"], params["t_add"])
     C.OUTPUT.mkdir(parents=True, exist_ok=True)
