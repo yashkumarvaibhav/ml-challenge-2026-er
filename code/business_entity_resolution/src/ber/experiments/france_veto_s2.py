@@ -79,21 +79,6 @@ def write(base: str):
     print(f"France rows replaced: {fr.height:,}")
 
 
-if __name__ == "__main__":
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--write")
-    ap.add_argument("--write2", help="base tag: France rows from the veto re-score at --t-add-fr, optional --relaxed")
-    ap.add_argument("--t-add-fr", type=float, default=TD)
-    ap.add_argument("--relaxed", action="store_true")
-    a = ap.parse_args()
-    if a.write2:
-        write2(a.write2, a.t_add_fr, a.relaxed)
-    elif a.write:
-        write(a.write)
-    else:
-        main()
-
-
 def write2(base: str, t_add_fr: float, relaxed: bool):
     """output/ = `base` with France rows from the veto re-scored universe at t_add_fr, optionally also dropping
     relaxed category swaps (typo'd category words / extra filler words; ber.experiments.france_category_swap)."""
@@ -145,3 +130,18 @@ def write2(base: str, t_add_fr: float, relaxed: bool):
     out.write_csv(C.OUTPUT / "matching_results.tsv", separator="\t", quote_style="never")
     shutil.copyfile(arch / "candidate_pairs.tsv", C.OUTPUT / "candidate_pairs.tsv")
     print(f"France pairs: {b.height:,} (t_add_fr {t_add_fr}, relaxed {relaxed})")
+
+
+if __name__ == "__main__":
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--write")
+    ap.add_argument("--write2", help="base tag: France rows from the veto re-score at --t-add-fr, optional --relaxed")
+    ap.add_argument("--t-add-fr", type=float, default=TD)
+    ap.add_argument("--relaxed", action="store_true")
+    a = ap.parse_args()
+    if a.write2:
+        write2(a.write2, a.t_add_fr, a.relaxed)
+    elif a.write:
+        write(a.write)
+    else:
+        main()
