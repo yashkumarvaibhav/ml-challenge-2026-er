@@ -28,14 +28,16 @@ SMALL = {  # learned artifacts needed to run inference without retraining the Li
     "cache/maps/self_maps_test.json": "self-trained France normalization maps (test pseudo-pairs, FAQ-allowed)",
     "models/lgb_v4.txt": "v4 LightGBM (prerequisite: France pseudo-pairs, encoder hard negatives)",
     "models/lgb_v6.txt": "v6 stage-1 LightGBM",
-    "models/lgb_s2_v6_e5base.txt": "v6 stage-2 LightGBM (with e5-base CE feature)",
-    "experiments/v6/decision_params_s2_e5base.json": "decision thresholds used for matching_results.tsv",
+    "models/lgb_s2_v6_e5base2.txt": "v6 stage-2 LightGBM (with the e5base2 CE feature)",
+    "experiments/v6/decision_params_s2_e5base2.json": "decision thresholds used for matching_results.tsv (t_any 0.4, t_add 0.75)",
+    "experiments/v6/france_category_swap.json": "France category words mined label-free from accepted test pairs (category-swap rule)",
 }
 LARGE = {
     "models/dense_e5small/model.pt": ("fine-tuned bi-encoder (dense retrieval)", "intfloat/multilingual-e5-small", "MIT", "117.7M",
                                       "614241f622f53c4eeff9890bdc4f31cfecc418b3", "python -m ber.dense --steps data,tokenize,train"),
-    "models/ce_e5base/model.pt": ("fine-tuned cross-encoder (stage-2 band feature)", "intfloat/multilingual-e5-base", "MIT", "278.0M",
-                                  "d128750597153bb5987e10b1c3493a34e5a4502a", "BER_CE=e5base python -m ber.cross_encoder --steps data,train"),
+    "models/ce_e5base2/model.pt": ("fine-tuned cross-encoder (stage-2 band feature; continued from ce_e5base on v6 hard negatives)",
+                                   "intfloat/multilingual-e5-base", "MIT", "278.0M", "d128750597153bb5987e10b1c3493a34e5a4502a",
+                                   "BER_CE=e5base python -m ber.cross_encoder --steps data,train && BER_CE=e5base2 python -m ber.cross_encoder --steps data,train"),
 }
 
 
