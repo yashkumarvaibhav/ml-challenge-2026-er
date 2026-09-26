@@ -30,15 +30,21 @@ CE_NAME = os.environ.get("BER_CE", "e5small")
 BASES = {"e5small": ("intfloat/multilingual-e5-small", "614241f622f53c4eeff9890bdc4f31cfecc418b3"),
          "e5base": ("intfloat/multilingual-e5-base", "d128750597153bb5987e10b1c3493a34e5a4502a"),
          "e5large": ("intfloat/multilingual-e5-large", "3d7cfbdacd47fdda877c5cd8a79fbcc4f2a574f3"),     # MIT, ~560M
-         "bgerr": ("BAAI/bge-reranker-v2-m3", "953dc6f6f85a1b2dbfca4c34a2796e7dde08d41e")}          # Apache-2.0, ~568M
+         "bgerr": ("BAAI/bge-reranker-v2-m3", "953dc6f6f85a1b2dbfca4c34a2796e7dde08d41e"),          # Apache-2.0, ~568M
+         # e5-base CE continued on v6-candidate hard negatives (warm start from models/ce_e5base; same base model)
+         "e5base2": ("intfloat/multilingual-e5-base", "d128750597153bb5987e10b1c3493a34e5a4502a")}
 # a model pre-trained AS a cross-encoder keeps its own sequence-classification head (reviewer 18:10 UTC);
 # plain encoders get mean pooling + a new linear head
 SEQCLS = CE_NAME == "bgerr"
 N_PAIRS = int(os.environ.get("BER_CE_NPAIRS", "0"))  # 0 = all CE training pairs; >0 = bounded pilot fit
+# e5base2: hard negatives from the v6 candidate set (dense retrieval) and a warm start from the e5-base CE
+V6NEG = CE_NAME == "e5base2"
+INIT = C.ROOT / "models" / "ce_e5base" / "model.pt" if V6NEG else None
 BASE = C.ROOT / "models" / "hf" / BASES[CE_NAME][0].split("/")[1]
 OUT = C.ROOT / "models" / f"ce_{CE_NAME}"
 SUFFIX = "" if CE_NAME == "e5small" else f"_{CE_NAME}"  # cache/report names of non-default CEs
 DATA = C.CACHE / "ce"
+PAIRS = DATA / f"train_pairs{'' if CE_NAME in ('e5small', 'e5base', 'bgerr', 'e5large') else '_' + CE_NAME}.parquet"
 MAX_LEN, LR, NEG_PER_POS = 128, 3e-5, 2
 BATCH = int(os.environ.get("BER_CE_BATCH", "256"))
 BAND = (0.01, 0.995)
@@ -88,8 +94,12 @@ def data():
     v4_train = sp.filter(pl.col("is_train")).sample(400_000, seed=C.SEED).select(pl.col("entity_id").alias("s1"))
     s2_train = sp.filter(pl.col("is_train")).select(pl.col("entity_id").alias("s1")).sample(400_000, seed=C.SEED + 99)
     ce_s1 = v4_train.join(s2_train, on="s1", how="anti")
-    cand = pl.read_parquet(C.CACHE / "runs" / "v4_cand_train_w20.parquet" if (C.CACHE / "runs" / "v4_cand_train_w20.parquet").exists()
-                           else C.CACHE / "cand" / "train_w20.parquet", columns=["s1", "m", "prio", "s_c"]).join(ce_s1, on="s1")
+    if V6NEG:  # v6 candidates; hardest negatives = highest bi-encoder cosine (the pairs the v6 matcher is unsure about)
+        cand = pl.read_parquet(C.CACHE / "v6" / "cand" / "train_w20.parquet", columns=["s1", "m", "pri", "d_cos"]).join(ce_s1, on="s1") \
+            .with_columns(pl.lit(0).alias("prio"), pl.col("d_cos").alias("s_c"))
+    else:
+        cand = pl.read_parquet(C.CACHE / "runs" / "v4_cand_train_w20.parquet" if (C.CACHE / "runs" / "v4_cand_train_w20.parquet").exists()
+                               else C.CACHE / "cand" / "train_w20.parquet", columns=["s1", "m", "prio", "s_c"]).join(ce_s1, on="s1")
     truth = load_train_pairs().select("s1", "m").with_columns(pl.lit(1, pl.Int8).alias("y"))
     d = cand.join(truth, on=["s1", "m"], how="left").with_columns(pl.col("y").fill_null(0))
     pos = d.filter(pl.col("y") == 1)
@@ -101,7 +111,7 @@ def data():
     tr = pl.concat([pos.select("s1", "m", "y"), neg.select("s1", "m", "y")]).sample(fraction=1.0, shuffle=True, seed=C.SEED)
     tr = with_text(tr, "train")
     DATA.mkdir(parents=True, exist_ok=True)
-    tr.write_parquet(DATA / "train_pairs.parquet")
+    tr.write_parquet(PAIRS)
     step("ce", f"data: {ce_s1.height:,} S1s, {tr.height:,} pairs (pos {int(tr['y'].sum()):,})")
 
 
@@ -123,7 +133,10 @@ def train():
     dev = device()
     tok = AutoTokenizer.from_pretrained(BASE)
     model = CrossEncoder().to(dev)
-    d = pl.read_parquet(DATA / "train_pairs.parquet").sample(fraction=1.0, shuffle=True, seed=C.SEED + 5)  # joins may reorder
+    if INIT is not None:
+        model.load_state_dict(torch.load(INIT, map_location=dev))
+        step("ce", f"warm start from {INIT}")
+    d = pl.read_parquet(PAIRS).sample(fraction=1.0, shuffle=True, seed=C.SEED + 5)  # joins may reorder
     if N_PAIRS:
         d = d.head(N_PAIRS)
     t1, t2, y = d["t1"].to_list(), d["t2"].to_list(), torch.tensor(d["y"].to_numpy(), dtype=torch.float32)
@@ -193,7 +206,7 @@ def bench(n_train_batches: int = 30, n_score: int = 50_000):
     dev = device()
     tok = AutoTokenizer.from_pretrained(BASE)
     model = CrossEncoder().to(dev)
-    d = pl.read_parquet(DATA / "train_pairs.parquet").head(BATCH * n_train_batches + n_score)
+    d = pl.read_parquet(PAIRS).head(BATCH * n_train_batches + n_score)
     ids_np, mask_np = pretokenize(d["t1"].to_list(), d["t2"].to_list(), tok, f"ce bench {CE_NAME} tokenize")
     y = torch.tensor(d["y"].to_numpy(), dtype=torch.float32)
     opt = torch.optim.AdamW(model.parameters(), lr=LR)
