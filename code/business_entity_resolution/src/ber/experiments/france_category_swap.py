@@ -121,7 +121,7 @@ def main():
 def write(base: str, countries=("France",)):
     """output/ = archived package `base` minus the category-swap pairs of `countries` (others byte-identical)."""
     import shutil
-    arch = C.ROOT / "submissions" / "archive" / base
+    arch = C.OUTPUT if base == "output" else C.ROOT / "submissions" / "archive" / base  # "output": apply in place (reproduction)
     m = pl.read_csv(arch / "matching_results.tsv", separator="\t", quote_char=None, infer_schema_length=0)
     c1, c2 = m.columns
     t1 = pl.read_parquet(C.CACHE / "test_source1.parquet", columns=["entity_id", "country"]).rename({"entity_id": "s1"})
@@ -134,7 +134,8 @@ def write(base: str, countries=("France",)):
     assert out[c1].to_list() == m[c1].to_list()
     C.OUTPUT.mkdir(parents=True, exist_ok=True)
     out.write_csv(C.OUTPUT / "matching_results.tsv", separator="\t", quote_style="never")
-    shutil.copyfile(arch / "candidate_pairs.tsv", C.OUTPUT / "candidate_pairs.tsv")
+    if arch != C.OUTPUT:
+        shutil.copyfile(arch / "candidate_pairs.tsv", C.OUTPUT / "candidate_pairs.tsv")
     print(f"removed {drops.height:,} pairs ({', '.join(countries)}); rows {out.height:,}")
 
 

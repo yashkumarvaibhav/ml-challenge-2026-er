@@ -140,7 +140,7 @@ def main():
 
 
 def write(base: str, only: str = "both"):
-    arch = C.ROOT / "submissions" / "archive" / base
+    arch = C.OUTPUT if base == "output" else C.ROOT / "submissions" / "archive" / base  # "output": apply in place (reproduction)
     m = pl.read_csv(arch / "matching_results.tsv", separator="\t", quote_char=None, infer_schema_length=0)
     c1, c2 = m.columns
     t1, rec = _france_accepted()
@@ -154,7 +154,8 @@ def write(base: str, only: str = "both"):
     out = m.select(c1).join(g, on=c1, how="left").with_columns(pl.col(c2).fill_null(""))
     assert out[c1].to_list() == m[c1].to_list()
     out.write_csv(C.OUTPUT / "matching_results.tsv", separator="\t", quote_style="never")
-    shutil.copyfile(arch / "candidate_pairs.tsv", C.OUTPUT / "candidate_pairs.tsv")
+    if arch != C.OUTPUT:
+        shutil.copyfile(arch / "candidate_pairs.tsv", C.OUTPUT / "candidate_pairs.tsv")
     print(f"{base}: France street_diff {int(f['street_diff'].sum()):,}, swap2 {int(f['swap2'].sum()):,}, removed {drop.height:,}")
 
 
