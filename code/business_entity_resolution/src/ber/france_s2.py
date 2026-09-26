@@ -213,11 +213,41 @@ def apply():
     step("france_s2", f"applied France model to {d.height:,} real France pairs")
 
 
+def write(base: str, t_any: float = 0.5, t_add: float = 0.7):
+    """output/ = archived `base` with France rows from the France model (t_any/t_add, thresholds tuned on synthetic
+    half A), then the France street rule and category-swap rule applied (both confirmed on public). US/India untouched."""
+    import shutil
+    from .experiments.france_category_swap import classify
+    from .experiments.france_street_diff import street_diff
+    arch = C.ROOT / "submissions" / "archive" / base
+    m = pl.read_csv(arch / "matching_results.tsv", separator="\t", quote_char=None, infer_schema_length=0)
+    c1, c2 = m.columns
+    t1 = pl.read_parquet(C.CACHE / "test_source1.parquet").filter(pl.col("country") == "France").select(
+        pl.col("entity_id").alias("s1"), pl.col("business_name").alias("n1"), pl.col("business_address").alias("a1"))
+    rec = pl.concat([pl.read_parquet(C.CACHE / f"test_source{k}.parquet") for k in (2, 3)]).select(
+        pl.col("entity_id").alias("m"), pl.col("business_name").alias("n2"), pl.col("business_address").alias("a2"))
+    cats = _cats()
+    d = decide(pl.read_parquet(S2 / f"test_pred{SFX}_france_model.parquet"), t_any, t_add).join(t1, on="s1").join(rec, on="m")
+    keep = pl.Series([not street_diff(a, b) and not ((c := classify(x, y)) and c[0] and c[1] in cats)
+                      for a, b, x, y in zip(d["a1"], d["a2"], d["n1"], d["n2"])])
+    d = d.filter(keep).select("s1", "m")
+    g = d.group_by("s1").agg(pl.col("m").sort().str.join(",").alias("_new")).rename({"s1": c1})
+    frc = t1.select(pl.col("s1").alias(c1)).with_columns(pl.lit(True).alias("_fr"))
+    out = m.join(frc, on=c1, how="left").join(g, on=c1, how="left").with_columns(
+        pl.when(pl.col("_fr")).then(pl.col("_new").fill_null("")).otherwise(pl.col(c2).fill_null("")).alias(c2)).select(c1, c2)
+    assert out[c1].to_list() == m[c1].to_list()
+    C.OUTPUT.mkdir(parents=True, exist_ok=True)
+    out.write_csv(C.OUTPUT / "matching_results.tsv", separator="\t", quote_style="never")
+    shutil.copyfile(arch / "candidate_pairs.tsv", C.OUTPUT / "candidate_pairs.tsv")
+    step("france_s2", f"write: France rows from the France model ({t_any}/{t_add}) + street + swap rules; {d.height:,} France pairs")
+
+
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("--steps", required=True)
+    ap.add_argument("--base", default="sub-2026-09-27-2")
     a = ap.parse_args()
-    fns = {"feats_syn": feats_syn, "fit": fit, "eval_syn": eval_syn, "eval_cross": eval_cross, "feats_test": feats_test, "apply": apply}
+    fns = {"feats_syn": feats_syn, "fit": fit, "eval_syn": eval_syn, "eval_cross": eval_cross, "feats_test": feats_test, "apply": apply, "write": lambda: write(a.base)}
     for s in a.steps.split(","):
         step("france_s2", f"step {s} ...")
         fns[s]()
