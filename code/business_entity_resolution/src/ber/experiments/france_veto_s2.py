@@ -25,7 +25,7 @@ from .france_category_swap import category_words, classify
 P_MIN, TA, TD = 0.005, 0.4, 0.75
 
 
-def main():
+def main(ce_file=None, out_suffix="_frveto"):
     t1 = pl.read_parquet(C.CACHE / "test_source1.parquet").select(pl.col("entity_id").alias("s1"), pl.col("business_name").alias("n1"), "country")
     rec = pl.concat([pl.read_parquet(C.CACHE / f"test_source{s}.parquet") for s in (2, 3)]).select(pl.col("entity_id").alias("m"), pl.col("business_name").alias("n2"))
     old = pl.read_parquet(S2 / f"test_pred{SFX}.parquet")
@@ -40,14 +40,14 @@ def main():
     st2 = st.join(veto, on=["s1", "m"], how="left").with_columns(
         pl.when(pl.col("_veto")).then(0.0).otherwise(pl.col("p1")).alias("p1")).drop("_veto")
     cand = pl.read_parquet(C.WORK / "cand" / "test.parquet")
-    d = _with_ce(s2_features(st2, cand, _a_null("test")), S2 / f"ce_test{SFX}.parquet")
+    d = _with_ce(s2_features(st2, cand, _a_null("test")), ce_file or (S2 / f"ce_test{SFX}.parquet"))
     d = d.join(veto, on=["s1", "m"], how="left").with_columns(
         [pl.when(pl.col("_veto")).then(None).otherwise(pl.col(c)).alias(c) for c in ("ce", "ce_minus_p1")]).drop("_veto")
     booster = lgb.Booster(model_file=str(MODEL_S2))
     new = d.select("s1", "m").with_columns(pl.Series("p", booster.predict(d.select(booster.feature_name()).to_numpy())))
     new_fr = new.join(fr.select("s1"), on="s1").join(veto, on=["s1", "m"], how="anti")
     out = pl.concat([old.join(fr.select("s1"), on="s1", how="anti"), new_fr])
-    out.write_parquet(S2 / f"test_pred{SFX}_frveto.parquet")
+    out.write_parquet(S2 / f"test_pred{SFX}{out_suffix}.parquet")
     veto.select("s1", "m").write_parquet(S2 / "france_veto_pairs_test.parquet")
     a = decide(old.join(fr.select("s1"), on="s1"), TA, TD)
     swap8 = a.join(veto, on=["s1", "m"], how="anti")  # ~ sub-2026-09-26-8's France decisions (strict swaps among accepted)
@@ -79,7 +79,7 @@ def write(base: str):
     print(f"France rows replaced: {fr.height:,}")
 
 
-def write2(base: str, t_add_fr: float, relaxed: bool):
+def write2(base: str, t_add_fr: float, relaxed: bool, pred_suffix: str = "_frveto"):
     """output/ = `base` with France rows from the veto re-scored universe at t_add_fr, optionally also dropping
     relaxed category swaps (typo'd category words / extra filler words; ber.experiments.france_category_swap)."""
     import collections
@@ -91,7 +91,7 @@ def write2(base: str, t_add_fr: float, relaxed: bool):
     t1 = pl.read_parquet(C.CACHE / "test_source1.parquet").select(pl.col("entity_id").alias("s1"), pl.col("business_name").alias("n1"), "country")
     fr = t1.filter(pl.col("country") == "France")
     rec = pl.concat([pl.read_parquet(C.CACHE / f"test_source{s}.parquet") for s in (2, 3)]).select(pl.col("entity_id").alias("m"), pl.col("business_name").alias("n2"))
-    b = decide(pl.read_parquet(S2 / f"test_pred{SFX}_frveto.parquet").join(fr.select("s1"), on="s1"), TA, t_add_fr)
+    b = decide(pl.read_parquet(S2 / f"test_pred{SFX}{pred_suffix}.parquet").join(fr.select("s1"), on="s1"), TA, t_add_fr)
     if relaxed:
         acc = b.join(fr, on="s1").join(rec, on="m")
         # category words from the PRE-veto accepted pairs (after the veto, swaps are rare and the counts vanish)
@@ -139,10 +139,13 @@ if __name__ == "__main__":
     ap.add_argument("--write2", help="base tag: France rows from the veto re-score at --t-add-fr, optional --relaxed")
     ap.add_argument("--t-add-fr", type=float, default=TD)
     ap.add_argument("--relaxed", action="store_true")
+    ap.add_argument("--ce-file", help="CE score parquet (s1, m, ce) replacing ce_test{SFX} (e.g. France re-scored by a France CE)")
+    ap.add_argument("--out-suffix", default="_frveto")
+    ap.add_argument("--pred-suffix", default="_frveto", help="write2: which veto re-scored prediction file to read")
     a = ap.parse_args()
     if a.write2:
-        write2(a.write2, a.t_add_fr, a.relaxed)
+        write2(a.write2, a.t_add_fr, a.relaxed, a.pred_suffix)
     elif a.write:
         write(a.write)
     else:
-        main()
+        main(C.ROOT / a.ce_file if a.ce_file else None, a.out_suffix)
