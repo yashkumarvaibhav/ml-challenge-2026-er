@@ -213,9 +213,40 @@ def test_v3():
     step("s3", f"test_v3: band {tband.height:,} pairs ({tband['llm'].is_not_null().sum():,} 7B, {tband['llm15'].is_not_null().sum():,} 1.5B) -> test_pred_e5base2_llm3v3_{TAG}.parquet")
 
 
+# ---- v4 (27 Sep): v3 with the two LLM scores also on the upper band (stage-2 p in (0.95, 0.995]) ----
+def _v4_fill(band: pl.DataFrame, which: str) -> pl.DataFrame:
+    lg = lambda c: (pl.col(c).clip(1e-6, 1 - 1e-6) / (1 - pl.col(c).clip(1e-6, 1 - 1e-6))).log()
+    h7 = pl.read_parquet(S2 / f"llm_hiband_{which}_{TAG}.parquet").rename({"llm": "_h7"})
+    h15 = pl.read_parquet(S2 / f"llm_hiband_{which}_{TAG15}.parquet").rename({"llm": "_h15"})
+    return (band.join(h7, on=["s1", "m"], how="left").join(h15, on=["s1", "m"], how="left")
+            .with_columns(pl.coalesce("llm", "_h7").alias("llm"), pl.coalesce("llm15", "_h15").alias("llm15")).drop("_h7", "_h15")
+            .with_columns(lg("llm").alias("lllm"), lg("llm15").alias("lllm15")))
+
+
+def test_v4():
+    F = FEATS + EXTRA + ["lpx", "lllm15"]
+    sp = pl.read_parquet(C.CACHE / "splits" / "train_s1_split.parquet")
+    hold = sp.filter(pl.col("is_holdout") & ~pl.col("is_ghost") & (pl.col("holdout_half") == "A")).select(pl.col("entity_id").alias("s1"))
+    truth = load_train_pairs().select("s1", "m")
+    sc = pl.read_parquet(S2 / "holdout_pred_w0_e5base2.parquet").join(hold, on="s1")
+    ex = pl.read_parquet(S2 / "s2feats_w0_e5base2.parquet", columns=["s1", "m"] + EXTRA)
+    _, band = _v2_band(sc, "train", S2 / f"llm_s3band_w0_{TAG}.parquet", ex)
+    band = _v4_fill(_v3_extra(band, "train", 0), "holdout")
+    band = band.join(truth.with_columns(pl.lit(1).alias("y")), on=["s1", "m"], how="left").with_columns(pl.col("y").fill_null(0))
+    b = lgb.train(PARAMS, lgb.Dataset(band.select(F).to_numpy(), band["y"].to_numpy()), ROUNDS)
+    b.save_model(str(C.ROOT / "models" / f"lgb_s3v4_llm_{TAG}.txt"))
+    ts = pl.read_parquet(S2 / "test_pred_e5base2.parquet")
+    d, tband = _v2_band(ts, "test", S2 / f"llm_s3band_test_{TAG}.parquet", _test_extra())
+    tband = _v4_fill(_v3_extra(tband, "test"), "test")
+    p3 = tband.select("s1", "m").with_columns(pl.Series("p3", b.predict(tband.select(F).to_numpy())))
+    out = d.join(p3, on=["s1", "m"], how="left").with_columns(pl.coalesce("p3", "p").alias("p")).select("s1", "m", "p")
+    out.write_parquet(S2 / f"test_pred_e5base2_llm3v4_{TAG}.parquet")
+    step("s3", f"test_v4: band {tband.height:,} pairs ({tband['llm'].is_not_null().sum():,} 7B, {tband['llm15'].is_not_null().sum():,} 1.5B) -> test_pred_e5base2_llm3v4_{TAG}.parquet")
+
+
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("--steps", required=True)
     a = ap.parse_args()
     for s in a.steps.split(","):
-        {"holdout": holdout, "test": test, "test_v2": test_v2, "test_v3": test_v3}[s]()
+        {"holdout": holdout, "test": test, "test_v2": test_v2, "test_v3": test_v3, "test_v4": test_v4}[s]()
