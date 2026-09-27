@@ -32,6 +32,12 @@ SMALL = {  # learned artifacts needed to run inference without retraining the Li
     "experiments/v6/decision_params_s2_e5base2.json": "decision thresholds used for matching_results.tsv (t_any 0.4, t_add 0.75)",
     "experiments/v6/france_category_swap.json": "France category words mined label-free from accepted test pairs (category-swap rule)",
 }
+STAGE3 = {  # sub-2026-09-27-5 (--stage3): US/India stage 3 on the stage-2 uncertain band
+    "models/lgb_s3_llm_qwen7b_r3.txt": "stage-3 LightGBM (logit p2, logit LLM, null flag, S1 rank/top, record's best other; fit on holdout half A, world 0)",
+    "experiments/v6/decision_params_s3_qwen7b_r3.json": "stage-3 decision thresholds for US/India (t_any 0.5, t_add 0.75); France rows = sub-2026-09-27-2",
+    "models/llm_ce_qwen7b_r3/adapter_config.json": "LoRA adapter config of the Qwen2.5-7B pair classifier (r=16, sequence-classification head)",
+    "models/llm_ce_qwen7b_r3/adapter_model.safetensors": "LoRA adapter weights + score head of the Qwen2.5-7B pair classifier (3 rounds: 80k + 160k + 160k CE pairs)",
+}
 LARGE = {
     "models/dense_e5small/model.pt": ("fine-tuned bi-encoder (dense retrieval)", "intfloat/multilingual-e5-small", "MIT", "117.7M",
                                       "614241f622f53c4eeff9890bdc4f31cfecc418b3", "python -m ber.dense --steps data,tokenize,train"),
@@ -49,7 +55,7 @@ def sha256(p: Path) -> str:
     return h.hexdigest()
 
 
-def models_md() -> str:
+def models_md(stage3: bool = False) -> str:
     lines = ["# Models and learned artifacts", "",
              "All models are fine-tuned or trained only on the supplied training data and run offline. No external data or APIs.", "",
              "## Pretrained encoders (downloaded once, pinned)", "",
@@ -58,15 +64,17 @@ def models_md() -> str:
     for f, (role, base, lic, n, rev, cmd) in LARGE.items():
         p = C.ROOT / f
         lines.append(f"| `{f}` | {role} | `{base}` | {lic} | {n} | `{rev}` | `{sha256(p) if p.exists() else 'missing'}` | `{cmd}` |")
+    if stage3:
+        lines.append("| `models/llm_ce_qwen7b_r3/` (LoRA adapter, included) | stage-3 pair classifier on the US/India stage-2 uncertain band | `Qwen/Qwen2.5-7B` | Apache-2.0 | 7.6B | `d149729398750b98c0af14eb82c78cfe92750796` | see below | README \"Stage 3\" |")
     lines += ["", "## Included small artifacts (`artifacts/`)", "", "| File | What | SHA-256 |", "|---|---|---|"]
-    for f, what in SMALL.items():
+    for f, what in {**SMALL, **(STAGE3 if stage3 else {})}.items():
         p = C.ROOT / f
         lines.append(f"| `{Path(f).name}` | {what} | `{sha256(p)}` |")
     lines += ["", "LightGBM (MIT) models are trained locally by `ber.pipeline` / `ber.stage2`."]
     return "\n".join(lines) + "\n"
 
 
-def main(tag: str, team: str, with_weights: bool):
+def main(tag: str, team: str, with_weights: bool, stage3: bool = False):
     arch = C.ROOT / "submissions" / "archive" / tag
     meta = json.loads((arch / "meta.json").read_text())
     for n in ("matching_results.tsv", "candidate_pairs.tsv", "code.zip"):
@@ -84,7 +92,11 @@ def main(tag: str, team: str, with_weights: bool):
                     z.writestr(f"code/{info.filename}", cz.read(info.filename))
         for f in SMALL:
             z.write(C.ROOT / f, f"code/business_entity_resolution/artifacts/{Path(f).name}")
-        z.writestr("code/business_entity_resolution/artifacts/MODELS.md", models_md())
+        if stage3:
+            for f in STAGE3:
+                sub = "llm_ce_qwen7b_r3/" if "llm_ce_qwen7b_r3/" in f else ""
+                z.write(C.ROOT / f, f"code/business_entity_resolution/artifacts/{sub}{Path(f).name}")
+        z.writestr("code/business_entity_resolution/artifacts/MODELS.md", models_md(stage3))
         if with_weights:
             for f in LARGE:
                 z.write(C.ROOT / f, f"code/business_entity_resolution/artifacts/{f.replace('/', '__')}")
@@ -125,5 +137,6 @@ if __name__ == "__main__":
     ap.add_argument("--tag", required=True)
     ap.add_argument("--team", default="GitBoosters")
     ap.add_argument("--with-weights", action="store_true")
+    ap.add_argument("--stage3", action="store_true", help="include the stage-3 (Qwen2.5-7B LoRA) artifacts of sub-2026-09-27-5")
     a = ap.parse_args()
-    main(a.tag, a.team, a.with_weights)
+    main(a.tag, a.team, a.with_weights, a.stage3)
