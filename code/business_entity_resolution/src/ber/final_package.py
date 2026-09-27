@@ -38,6 +38,15 @@ STAGE3 = {  # sub-2026-09-27-5 (--stage3): US/India stage 3 on the stage-2 uncer
     "models/llm_ce_qwen7b_r3/adapter_config.json": "LoRA adapter config of the Qwen2.5-7B pair classifier (r=16, sequence-classification head)",
     "models/llm_ce_qwen7b_r3/adapter_model.safetensors": "LoRA adapter weights + score head of the Qwen2.5-7B pair classifier (3 rounds: 80k + 160k + 160k CE pairs)",
 }
+STAGE3V4 = {  # sub-2026-09-27-9/-10 (--stage3v4)
+    "models/lgb_s3v4_llm_qwen7b_r3.txt": "stage-3 v4 LightGBM (band 0.01-0.995; stage-2 context, S2X score, Qwen-7B and Qwen-1.5B scores; fit on holdout half A, world 0)",
+    "experiments/v6/decision_params_s3_qwen7b_r3.json": "stage-3 decision thresholds (t_any 0.5, t_add 0.75)",
+    "models/llm_ce_qwen7b_r3/adapter_config.json": "LoRA adapter config of the Qwen2.5-7B pair classifier",
+    "models/llm_ce_qwen7b_r3/adapter_model.safetensors": "LoRA adapter + score head of the Qwen2.5-7B pair classifier (80k + 160k + 160k CE pairs)",
+    "models/llm_ce_qwen15_r3/adapter_config.json": "LoRA adapter config of the Qwen2.5-1.5B pair classifier",
+    "models/llm_ce_qwen15_r3/adapter_model.safetensors": "LoRA adapter + score head of the Qwen2.5-1.5B pair classifier (150k + 300k + 300k CE pairs)",
+    "cache/v6/s2/france_llm_veto_scores.parquet": "Qwen2.5-7B scores of the France accepted pairs with stage-2 p in (0.95, 0.999] (France LLM veto)",
+}
 LARGE = {
     "models/dense_e5small/model.pt": ("fine-tuned bi-encoder (dense retrieval)", "intfloat/multilingual-e5-small", "MIT", "117.7M",
                                       "614241f622f53c4eeff9890bdc4f31cfecc418b3", "python -m ber.dense --steps data,tokenize,train"),
@@ -55,7 +64,7 @@ def sha256(p: Path) -> str:
     return h.hexdigest()
 
 
-def models_md(stage3: bool = False) -> str:
+def models_md(stage3: bool = False, v4: bool = False) -> str:
     lines = ["# Models and learned artifacts", "",
              "All models are fine-tuned or trained only on the supplied training data and run offline. No external data or APIs.", "",
              "## Pretrained encoders (downloaded once, pinned)", "",
@@ -66,15 +75,18 @@ def models_md(stage3: bool = False) -> str:
         lines.append(f"| `{f}` | {role} | `{base}` | {lic} | {n} | `{rev}` | `{sha256(p) if p.exists() else 'missing'}` | `{cmd}` |")
     if stage3:
         lines.append("| `models/llm_ce_qwen7b_r3/` (LoRA adapter, included) | stage-3 pair classifier on the US/India stage-2 uncertain band | `Qwen/Qwen2.5-7B` | Apache-2.0 | 7.6B | `d149729398750b98c0af14eb82c78cfe92750796` | see below | README \"Stage 3\" |")
+    if v4:
+        lines.append("| `models/llm_ce_qwen7b_r3/` (LoRA adapter, included) | stage-3 pair classifier | `Qwen/Qwen2.5-7B` | Apache-2.0 | 7.6B | `d149729398750b98c0af14eb82c78cfe92750796` | see below | README \"Stage 3\" |")
+        lines.append("| `models/llm_ce_qwen15_r3/` (LoRA adapter, included) | stage-3 second pair classifier | `Qwen/Qwen2.5-1.5B` | Apache-2.0 | 1.5B | `8faed761d45a263340a0528343f099c05c9a4323` | see below | README \"Stage 3 v4\" |")
     lines += ["", "## Included small artifacts (`artifacts/`)", "", "| File | What | SHA-256 |", "|---|---|---|"]
-    for f, what in {**SMALL, **(STAGE3 if stage3 else {})}.items():
+    for f, what in {**SMALL, **(STAGE3 if stage3 else {}), **(STAGE3V4 if v4 else {})}.items():
         p = C.ROOT / f
         lines.append(f"| `{Path(f).name}` | {what} | `{sha256(p)}` |")
     lines += ["", "LightGBM (MIT) models are trained locally by `ber.pipeline` / `ber.stage2`."]
     return "\n".join(lines) + "\n"
 
 
-def main(tag: str, team: str, with_weights: bool, stage3: bool = False):
+def main(tag: str, team: str, with_weights: bool, stage3: bool = False, v4: bool = False):
     arch = C.ROOT / "submissions" / "archive" / tag
     meta = json.loads((arch / "meta.json").read_text())
     for n in ("matching_results.tsv", "candidate_pairs.tsv", "code.zip"):
@@ -96,7 +108,11 @@ def main(tag: str, team: str, with_weights: bool, stage3: bool = False):
             for f in STAGE3:
                 sub = "llm_ce_qwen7b_r3/" if "llm_ce_qwen7b_r3/" in f else ""
                 z.write(C.ROOT / f, f"code/business_entity_resolution/artifacts/{sub}{Path(f).name}")
-        z.writestr("code/business_entity_resolution/artifacts/MODELS.md", models_md(stage3))
+        if v4:
+            for f in STAGE3V4:
+                sub = next((d + "/" for d in ("llm_ce_qwen7b_r3", "llm_ce_qwen15_r3") if f"/{d}/" in f), "")
+                z.write(C.ROOT / f, f"code/business_entity_resolution/artifacts/{sub}{Path(f).name}")
+        z.writestr("code/business_entity_resolution/artifacts/MODELS.md", models_md(stage3 and not v4, v4))
         if with_weights:
             for f in LARGE:
                 z.write(C.ROOT / f, f"code/business_entity_resolution/artifacts/{f.replace('/', '__')}")
@@ -137,6 +153,7 @@ if __name__ == "__main__":
     ap.add_argument("--tag", required=True)
     ap.add_argument("--team", default="GitBoosters")
     ap.add_argument("--with-weights", action="store_true")
-    ap.add_argument("--stage3", action="store_true", help="include the stage-3 (Qwen2.5-7B LoRA) artifacts of sub-2026-09-27-5")
+    ap.add_argument("--stage3", action="store_true", help="include the stage-3 (Qwen2.5-7B LoRA) artifacts of sub-2026-09-27-5/-7")
+    ap.add_argument("--stage3v4", action="store_true", help="include the stage-3 v4 artifacts of sub-2026-09-27-9/-10")
     a = ap.parse_args()
-    main(a.tag, a.team, a.with_weights, a.stage3)
+    main(a.tag, a.team, a.with_weights, a.stage3 and not a.stage3v4, a.stage3v4)
