@@ -136,9 +136,86 @@ def test():
     step("s3", f"test: stage-3 band {tband.height:,} pairs ({countries}) -> {name}")
 
 
+# ---- v2 (27 Sep): wider band + stage-2 context features; the LLM score is used where cached (band 0.05-0.95) ----
+EXTRA = ["lp1", "d_cos", "ce", "ce_minus_p1", "m_n_hi", "s_n_hi", "m_gap", "s_gap_top", "r_df", "r_dr", "m_n_cand", "s_n_cand"]
+V2_LO, V2_HI = 0.01, 0.995
+
+
+def _v2_band(sc: pl.DataFrame, split: str, llm_cache, extra: pl.DataFrame):
+    d = _ctx(sc).join(_anull(split), on="m", how="left")
+    band = d.filter(pl.col("p").is_between(V2_LO, V2_HI))
+    lc = pl.read_parquet(llm_cache) if llm_cache.exists() else pl.DataFrame(schema={"s1": pl.Utf8, "m": pl.Utf8, "llm": pl.Float32})
+    band = band.join(lc, on=["s1", "m"], how="left").with_columns(
+        (pl.col("llm").clip(1e-6, 1 - 1e-6) / (1 - pl.col("llm").clip(1e-6, 1 - 1e-6))).log().alias("lllm"))
+    return d, band.join(extra, on=["s1", "m"], how="left")
+
+
+def _test_extra() -> pl.DataFrame:
+    from .stage2 import _a_null, _with_ce, s2_features
+    path = S2 / "s2x_test_e5base2.parquet"
+    if not path.exists():
+        st = pl.read_parquet(C.WORK / "pred" / "test.parquet").rename({"p": "p1"})
+        cand = pl.read_parquet(C.WORK / "cand" / "test.parquet")
+        d = _with_ce(s2_features(st, cand, _a_null("test")), S2 / "ce_test_e5base2.parquet")
+        d.select(["s1", "m"] + EXTRA).write_parquet(path)
+    return pl.read_parquet(path)
+
+
+def test_v2():
+    """Stage 3 v2: fit on the world-0 band of holdout half A, apply to the test band (all countries)."""
+    F = FEATS + EXTRA
+    sp = pl.read_parquet(C.CACHE / "splits" / "train_s1_split.parquet")
+    hold = sp.filter(pl.col("is_holdout") & ~pl.col("is_ghost") & (pl.col("holdout_half") == "A")).select(pl.col("entity_id").alias("s1"))
+    truth = load_train_pairs().select("s1", "m")
+    sc = pl.read_parquet(S2 / "holdout_pred_w0_e5base2.parquet").join(hold, on="s1")
+    ex = pl.read_parquet(S2 / "s2feats_w0_e5base2.parquet", columns=["s1", "m"] + EXTRA)
+    _, band = _v2_band(sc, "train", S2 / f"llm_s3band_w0_{TAG}.parquet", ex)
+    band = band.join(truth.with_columns(pl.lit(1).alias("y")), on=["s1", "m"], how="left").with_columns(pl.col("y").fill_null(0))
+    b = lgb.train(PARAMS, lgb.Dataset(band.select(F).to_numpy(), band["y"].to_numpy()), ROUNDS)
+    b.save_model(str(C.ROOT / "models" / f"lgb_s3v2_llm_{TAG}.txt"))
+    ts = pl.read_parquet(S2 / "test_pred_e5base2.parquet")
+    d, tband = _v2_band(ts, "test", S2 / f"llm_s3band_test_{TAG}.parquet", _test_extra())
+    p3 = tband.select("s1", "m").with_columns(pl.Series("p3", b.predict(tband.select(F).to_numpy())))
+    out = d.join(p3, on=["s1", "m"], how="left").with_columns(pl.coalesce("p3", "p").alias("p")).select("s1", "m", "p")
+    out.write_parquet(S2 / f"test_pred_e5base2_llm3v2_{TAG}.parquet")
+    step("s3", f"test_v2: band {tband.height:,} pairs ({tband['llm'].is_not_null().sum():,} with LLM) -> test_pred_e5base2_llm3v2_{TAG}.parquet")
+
+
+# ---- v3 (27 Sep): v2 + the BER_S2X stage-2 challenger score + the Qwen2.5-1.5B pair classifier (qwen15_r3) ----
+TAG15 = "qwen15_r3"
+
+
+def _v3_extra(band: pl.DataFrame, split: str, w: int = 0) -> pl.DataFrame:
+    lg = lambda c: (pl.col(c).clip(1e-6, 1 - 1e-6) / (1 - pl.col(c).clip(1e-6, 1 - 1e-6))).log()
+    px = pl.read_parquet(S2 / (f"holdout_pred_w{w}_e5base2_x.parquet" if split == "train" else "test_pred_e5base2_x.parquet")).rename({"p": "px"})
+    l15 = pl.read_parquet(S2 / (f"llm_s3band_w{w}_{TAG15}.parquet" if split == "train" else f"llm_s3band_test_{TAG15}.parquet")).rename({"llm": "llm15"})
+    return band.join(px, on=["s1", "m"], how="left").join(l15, on=["s1", "m"], how="left").with_columns(lg("px").alias("lpx"), lg("llm15").alias("lllm15"))
+
+
+def test_v3():
+    """Stage 3 v3: fit on the world-0 band (0.01-0.995) of holdout half A, apply to the test band (all countries)."""
+    F = FEATS + EXTRA + ["lpx", "lllm15"]
+    sp = pl.read_parquet(C.CACHE / "splits" / "train_s1_split.parquet")
+    hold = sp.filter(pl.col("is_holdout") & ~pl.col("is_ghost") & (pl.col("holdout_half") == "A")).select(pl.col("entity_id").alias("s1"))
+    truth = load_train_pairs().select("s1", "m")
+    sc = pl.read_parquet(S2 / "holdout_pred_w0_e5base2.parquet").join(hold, on="s1")
+    ex = pl.read_parquet(S2 / "s2feats_w0_e5base2.parquet", columns=["s1", "m"] + EXTRA)
+    _, band = _v2_band(sc, "train", S2 / f"llm_s3band_w0_{TAG}.parquet", ex)
+    band = _v3_extra(band, "train", 0).join(truth.with_columns(pl.lit(1).alias("y")), on=["s1", "m"], how="left").with_columns(pl.col("y").fill_null(0))
+    b = lgb.train(PARAMS, lgb.Dataset(band.select(F).to_numpy(), band["y"].to_numpy()), ROUNDS)
+    b.save_model(str(C.ROOT / "models" / f"lgb_s3v3_llm_{TAG}.txt"))
+    ts = pl.read_parquet(S2 / "test_pred_e5base2.parquet")
+    d, tband = _v2_band(ts, "test", S2 / f"llm_s3band_test_{TAG}.parquet", _test_extra())
+    tband = _v3_extra(tband, "test")
+    p3 = tband.select("s1", "m").with_columns(pl.Series("p3", b.predict(tband.select(F).to_numpy())))
+    out = d.join(p3, on=["s1", "m"], how="left").with_columns(pl.coalesce("p3", "p").alias("p")).select("s1", "m", "p")
+    out.write_parquet(S2 / f"test_pred_e5base2_llm3v3_{TAG}.parquet")
+    step("s3", f"test_v3: band {tband.height:,} pairs ({tband['llm'].is_not_null().sum():,} 7B, {tband['llm15'].is_not_null().sum():,} 1.5B) -> test_pred_e5base2_llm3v3_{TAG}.parquet")
+
+
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("--steps", required=True)
     a = ap.parse_args()
     for s in a.steps.split(","):
-        {"holdout": holdout, "test": test}[s]()
+        {"holdout": holdout, "test": test, "test_v2": test_v2, "test_v3": test_v3}[s]()
