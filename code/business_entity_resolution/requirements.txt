@@ -1,4 +1,5 @@
-# Python 3.10.12. Pinned from the environment used to produce the submissions.
+# Python 3.10.12. Pinned from the environment used to produce the submissions
+# (full freeze of that environment: requirements_frozen.txt).
 polars==1.44.2
 pyarrow==20.0.0
 numpy==1.26.4
@@ -8,9 +9,12 @@ scikit-learn==1.4.2
 rapidfuzz==3.14.5
 Unidecode==1.4.0
 lightgbm==4.7.0
-# stage 2 + cross-encoder (GPU; intfloat/multilingual-e5-small, MIT)
+# bi-encoder / cross-encoder / stage-3 LLM pair classifiers (GPU; MIT and Apache-2.0 models, run offline)
 torch==2.4.1+cu121
 transformers==4.39.3
 huggingface-hub==0.36.2
 tokenizers==0.15.2
 safetensors==0.7.0
+# LoRA adapters of the Qwen2.5-7B / Qwen2.5-1.5B pair classifiers (ber.llm_ce)
+peft==0.10.0
+accelerate==1.15.0
