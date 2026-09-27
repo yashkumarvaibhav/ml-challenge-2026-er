@@ -47,6 +47,10 @@ STAGE3V4 = {  # sub-2026-09-27-9/-10 (--stage3v4)
     "models/llm_ce_qwen15_r3/adapter_model.safetensors": "LoRA adapter + score head of the Qwen2.5-1.5B pair classifier (150k + 300k + 300k CE pairs)",
     "cache/v6/s2/france_llm_veto_scores.parquet": "Qwen2.5-7B scores of the France accepted pairs with stage-2 p in (0.95, 0.999] (France LLM veto)",
 }
+FRANCE2711 = {  # scored sub-2026-09-27-11 (--france-2711)
+    "cache/v6/s2/france_numveto_2711_drops.parquet": "team-generated France house-number veto, limited to stage-2 p <= 0.999 (7,367 pairs)",
+    "cache/v6/s2/france_filler_2711_adds.parquet": "team-generated France filler rescue (339 pairs)",
+}
 LARGE = {
     "models/dense_e5small/model.pt": ("fine-tuned bi-encoder (dense retrieval)", "intfloat/multilingual-e5-small", "MIT", "117.7M",
                                       "614241f622f53c4eeff9890bdc4f31cfecc418b3", "python -m ber.dense --steps data,tokenize,train"),
@@ -64,9 +68,9 @@ def sha256(p: Path) -> str:
     return h.hexdigest()
 
 
-def models_md(stage3: bool = False, v4: bool = False) -> str:
+def models_md(stage3: bool = False, v4: bool = False, france_2711: bool = False) -> str:
     lines = ["# Models and learned artifacts", "",
-             "All models are fine-tuned or trained only on the supplied training data and run offline. No external data or APIs.", "",
+             "All models use only supplied challenge data and run offline. Stage-3 LightGBM is fitted on holdout half A; half B is the evaluation half. No external identity data or hosted APIs.", "",
              "## Pretrained encoders (downloaded once, pinned)", "",
              "| Fine-tuned file | Role | Base model | Licence | Parameters | Base revision | SHA-256 of fine-tuned weights | Regenerate |",
              "|---|---|---|---|---|---|---|---|"]
@@ -79,14 +83,18 @@ def models_md(stage3: bool = False, v4: bool = False) -> str:
         lines.append("| `models/llm_ce_qwen7b_r3/` (LoRA adapter, included) | stage-3 pair classifier | `Qwen/Qwen2.5-7B` | Apache-2.0 | 7.6B | `d149729398750b98c0af14eb82c78cfe92750796` | see below | README \"Stage 3\" |")
         lines.append("| `models/llm_ce_qwen15_r3/` (LoRA adapter, included) | stage-3 second pair classifier | `Qwen/Qwen2.5-1.5B` | Apache-2.0 | 1.5B | `8faed761d45a263340a0528343f099c05c9a4323` | see below | README \"Stage 3 v4\" |")
     lines += ["", "## Included small artifacts (`artifacts/`)", "", "| File | What | SHA-256 |", "|---|---|---|"]
-    for f, what in {**SMALL, **(STAGE3 if stage3 else {}), **(STAGE3V4 if v4 else {})}.items():
+    v4_files = {f: what for f, what in STAGE3V4.items() if not (france_2711 and f.endswith("france_llm_veto_scores.parquet"))}
+    for f, what in {**SMALL, **(STAGE3 if stage3 else {}), **(v4_files if v4 else {}),
+                    **(FRANCE2711 if france_2711 else {})}.items():
         p = C.ROOT / f
         lines.append(f"| `{Path(f).name}` | {what} | `{sha256(p)}` |")
     lines += ["", "LightGBM (MIT) models are trained locally by `ber.pipeline` / `ber.stage2`."]
     return "\n".join(lines) + "\n"
 
 
-def main(tag: str, team: str, with_weights: bool, stage3: bool = False, v4: bool = False):
+def main(tag: str, team: str, with_weights: bool, stage3: bool = False, v4: bool = False,
+         france_2711: bool = False):
+    assert not france_2711 or v4, "#27-11 uses stage 3 v4 for US/India"
     arch = C.ROOT / "submissions" / "archive" / tag
     meta = json.loads((arch / "meta.json").read_text())
     for n in ("matching_results.tsv", "candidate_pairs.tsv", "code.zip"):
@@ -110,9 +118,14 @@ def main(tag: str, team: str, with_weights: bool, stage3: bool = False, v4: bool
                 z.write(C.ROOT / f, f"code/business_entity_resolution/artifacts/{sub}{Path(f).name}")
         if v4:
             for f in STAGE3V4:
+                if france_2711 and f.endswith("france_llm_veto_scores.parquet"):
+                    continue
                 sub = next((d + "/" for d in ("llm_ce_qwen7b_r3", "llm_ce_qwen15_r3") if f"/{d}/" in f), "")
                 z.write(C.ROOT / f, f"code/business_entity_resolution/artifacts/{sub}{Path(f).name}")
-        z.writestr("code/business_entity_resolution/artifacts/MODELS.md", models_md(stage3 and not v4, v4))
+        if france_2711:
+            for f in FRANCE2711:
+                z.write(C.ROOT / f, f"code/business_entity_resolution/artifacts/{Path(f).name}")
+        z.writestr("code/business_entity_resolution/artifacts/MODELS.md", models_md(stage3 and not v4, v4, france_2711))
         if with_weights:
             for f in LARGE:
                 z.write(C.ROOT / f, f"code/business_entity_resolution/artifacts/{f.replace('/', '__')}")
@@ -155,5 +168,6 @@ if __name__ == "__main__":
     ap.add_argument("--with-weights", action="store_true")
     ap.add_argument("--stage3", action="store_true", help="include the stage-3 (Qwen2.5-7B LoRA) artifacts of sub-2026-09-27-5/-7")
     ap.add_argument("--stage3v4", action="store_true", help="include the stage-3 v4 artifacts of sub-2026-09-27-9/-10")
+    ap.add_argument("--france-2711", action="store_true", help="include exact #27-11 France veto and rescue lists")
     a = ap.parse_args()
-    main(a.tag, a.team, a.with_weights, a.stage3 and not a.stage3v4, a.stage3v4)
+    main(a.tag, a.team, a.with_weights, a.stage3 and not a.stage3v4, a.stage3v4, a.france_2711)
