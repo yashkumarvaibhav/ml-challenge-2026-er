@@ -1,0 +1,27 @@
+name: Public source checks
+on:
+  push:
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  public-content:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out all reachable history
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          fetch-depth: 0
+      - name: Check tracked content and history
+        run: python3 scripts/check_public_release.py --history
+      - name: Check Python and shell syntax
+        run: |
+          python3 - <<'PY'
+          import ast
+          import pathlib
+          import subprocess
+          for path in pathlib.Path('code').rglob('*.py'):
+              ast.parse(path.read_text(), filename=str(path))
+          for path in pathlib.Path('code').rglob('*.sh'):
+              subprocess.run(['bash', '-n', str(path)], check=True)
+          PY
